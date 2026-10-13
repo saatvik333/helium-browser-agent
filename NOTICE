@@ -1,0 +1,14 @@
+Helium Browser Agent
+Copyright 2026 Saatvik Sharma
+
+The agent-browser adapter recognizes a small JavaScript fill function from
+agent-browser 0.37.0, Copyright 2025 Vercel Inc., Apache License 2.0.
+Its replacement validates input and verifies native insertion. The upstream
+license is preserved in licenses/agent-browser-APACHE-2.0.txt.
+
+The optional benchmark reconstructs the installed browser-harness fill_input
+function at runtime for comparison. No browser-harness implementation is
+vendored. Its MIT license is reproduced in licenses/browser-harness-MIT.txt.
+
+Helium, browser-harness, browser-use and agent-browser are independent projects.
+This project is not an official distribution of any of them.

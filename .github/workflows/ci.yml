@@ -1,0 +1,32 @@
+name: Python checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    env:
+      BH_TELEMETRY: '0'
+      BROWSER_HARNESS_TELEMETRY: '0'
+      ANONYMIZED_TELEMETRY: 'false'
+      BROWSER_USE_CLOUD_SYNC: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run python -m unittest discover -s tests -v
+      - run: uv build
+      - name: Check wheel installation outside the checkout
+        run: |
+          uv venv /tmp/helium-wheel-test
+          uv pip install --python /tmp/helium-wheel-test/bin/python dist/*.whl
+          cd /tmp
+          /tmp/helium-wheel-test/bin/helium-agent --version
+          /tmp/helium-wheel-test/bin/helium-browser-use --help
+          /tmp/helium-wheel-test/bin/agent-browser-helium --help

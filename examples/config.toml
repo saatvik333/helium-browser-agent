@@ -1,0 +1,14 @@
+# Copy to ~/.config/helium-browser-agent/config.toml and edit for your machine.
+# Profile names must already exist in Helium. No profiles are created or renamed.
+default_profile = "Personal"
+personal_profile = "Personal"
+work_profile = "Work"
+# Optional paths. Use your Helium package's launcher, not the underlying ELF.
+# launcher = "/usr/bin/helium-browser"
+# profile_dir = "~/.config/net.imput.helium"
+# cache_dir = "~/.cache/helium-browser-agent"
+# agent_browser = "agent-browser"
+
+[workspaces]
+# "~/projects/work" = "Work"
+# "~/projects/work/another-account" = "Another account"

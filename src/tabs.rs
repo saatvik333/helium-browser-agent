@@ -369,7 +369,7 @@ pub async fn profiles(cx: &mut Cx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The browser if it is running; never launches Helium (for status and cleanup).
+/// The browser if it is running; never launches it (for status and cleanup).
 async fn running_browser(cx: &Cx<'_>) -> Result<Option<Arc<Browser>>> {
     if let Some(browser) = cx.hub.connected().await {
         return Ok(Some(browser));
@@ -386,7 +386,8 @@ pub async fn status(cx: &mut Cx<'_>) -> Result<()> {
         if cx.json {
             return print_json(cx, &json!({"session": cx.session, "browser": null}));
         }
-        cx.say(format!("session {} · Helium is not running (`hba open URL` starts it)", cx.session));
+        let name = cx.config()?.browser.name();
+        cx.say(format!("session {} · {name} is not running (`hba open URL` starts it)", cx.session));
         return Ok(());
     };
     let profile = cx.chosen_profile(&browser).ok();
@@ -448,7 +449,7 @@ pub async fn close(cx: &mut Cx<'_>, args: CloseArgs) -> Result<()> {
         return Ok(());
     }
     let Some(browser) = running_browser(cx).await? else {
-        bail!("Helium is not running; session state kept for a later `hba close`");
+        bail!("{} is not running; session state kept for a later `hba close`", cx.config()?.browser.name());
     };
     let (mut closed, mut released) = (0, 0);
     for (name, tab) in &tabs {

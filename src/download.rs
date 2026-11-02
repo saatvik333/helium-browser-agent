@@ -1,4 +1,4 @@
-//! Downloads started from a tab, observed without changing Helium's download settings.
+//! Downloads started from a tab, observed without changing the browser's download settings.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -143,13 +143,14 @@ pub async fn command(cx: &mut Cx<'_>, args: DownloadArgs) -> Result<()> {
             finished.is_some()
         })
         .await;
+    let name = browser.config().browser.name();
     let download = match (waited, finished) {
         (Ok(()), Some(download)) => download,
         (result, _) => {
             let started = page.downloads.lock().expect("downloads lock").since(mark.download_seq).next().cloned();
             return Err(match started {
                 Some(item) => anyhow::anyhow!(
-                    "the download of {} from {} did not finish within {:.0}s ({} of {} bytes); if Helium asks where to save files, answer its dialog",
+                    "the download of {} from {} did not finish within {:.0}s ({} of {} bytes); if {name} asks where to save files, answer its dialog",
                     item.filename,
                     crate::output::short_url(&item.url, 80),
                     cx.timeout.as_secs_f32(),
@@ -168,7 +169,7 @@ pub async fn command(cx: &mut Cx<'_>, args: DownloadArgs) -> Result<()> {
     }
     let saved = PathBuf::from(download.path.as_deref().with_context(|| {
         format!(
-            "{} finished, but Helium did not say where it saved it; look in its downloads folder",
+            "{} finished, but {name} did not say where it saved it; look in its downloads folder",
             download.filename
         )
     })?);

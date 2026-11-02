@@ -1,7 +1,7 @@
 //! Configuration, daemon and endpoint behavior that needs no browser. Each test gets its own
 //! runtime, config and data directories, so its daemon is private and tests run in parallel.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -12,10 +12,11 @@ const LOCAL_STATE: &str = r#"{"profile": {
     "info_cache": {"Default": {"name": "Personal"}, "Profile 3": {"name": "Modo - Work"}},
     "last_used": "Default", "last_active_profiles": ["Default"]}}"#;
 
-/// Python for a fake Helium that only stays alive.
+/// Python for a fake browser that only stays alive.
 const IDLE: &str = "import time; time.sleep(60)";
 
-/// Python for a fake Helium answering `/json/version` on its `--remote-debugging-port`.
+/// Python for a fake browser answering `/json/version` on its `--remote-debugging-port`; it
+/// creates the file named by its second argument once it listens.
 const VERSION_SERVER: &str = "
 import http.server, json, sys
 port = int(sys.argv[1].split('=')[1])
@@ -28,7 +29,69 @@ class Version(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-http.server.HTTPServer(('127.0.0.1', port), Version).serve_forever()
+server = http.server.HTTPServer(('127.0.0.1', port), Version)
+open(sys.argv[2], 'w').close()
+server.serve_forever()
+";
+
+/// Python for a fake browser in approval mode. It publishes its port in `DevToolsActivePort` in
+/// the data dir (first argument) and holds every WebSocket handshake, as a browser does until its
+/// user clicks Allow, until the file `allow` appears in the control dir (second argument). Then
+/// it completes them, creates `allowed`, and answers every command (`Browser.getVersion` with
+/// product `Fake/1`). The file `connections` counts the connections it accepted.
+const APPROVAL_BROWSER: &str = r"
+import base64, hashlib, json, os, socket, struct, sys, threading, time
+data, control = sys.argv[1], sys.argv[2]
+server = socket.socket()
+server.bind(('127.0.0.1', 0))
+server.listen()
+
+def serve(conn):
+    request = b''
+    while b'\r\n\r\n' not in request:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        request += chunk
+    while not os.path.exists(os.path.join(control, 'allow')):
+        time.sleep(0.02)
+    key = next(line.split(b':', 1)[1].strip() for line in request.split(b'\r\n')
+               if line.lower().startswith(b'sec-websocket-key:'))
+    accept = base64.b64encode(hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+    conn.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                 b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+    open(os.path.join(control, 'allowed'), 'w').close()
+    frames = conn.makefile('rb')
+    while True:
+        head = frames.read(2)
+        if len(head) < 2 or head[0] & 15 == 8:
+            return
+        length = head[1] & 127
+        if length == 126:
+            length = struct.unpack('>H', frames.read(2))[0]
+        elif length == 127:
+            length = struct.unpack('>Q', frames.read(8))[0]
+        mask = frames.read(4)
+        payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(frames.read(length)))
+        if head[0] & 15 != 1:
+            continue
+        command = json.loads(payload)
+        result = {'product': 'Fake/1'} if command['method'] == 'Browser.getVersion' else {}
+        reply = json.dumps({'id': command['id'], 'result': result}).encode()
+        size = struct.pack('B', len(reply)) if len(reply) < 126 else struct.pack('>BH', 126, len(reply))
+        conn.sendall(b'\x81' + size + reply)
+
+path = os.path.join(data, 'DevToolsActivePort')
+with open(path + '.tmp', 'w') as file:
+    file.write(f'{server.getsockname()[1]}\n/devtools/browser/abc\n')
+os.rename(path + '.tmp', path)
+count = 0
+while True:
+    conn = server.accept()[0]
+    count += 1
+    with open(os.path.join(control, 'connections'), 'w') as file:
+        file.write(str(count))
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()
 ";
 
 /// Temporary directories for one test, the daemon it starts and any fake browser; all removed
@@ -74,6 +137,7 @@ impl Home {
         command.args(args).env("XDG_RUNTIME_DIR", self.path("runtime")).env("XDG_CONFIG_HOME", self.path("config"));
         for name in [
             "HBA_CONFIG",
+            "HBA_BROWSER",
             "HBA_USER_DATA_DIR",
             "HBA_LAUNCHER",
             "HBA_HUMANIZE",
@@ -112,24 +176,24 @@ impl Home {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
-    /// Starts a process named `helium` that holds this home's data dir, as its `SingletonLock`
+    /// Starts a process named `process` that holds this home's data dir, as its `SingletonLock`
     /// says: Python running `code` with `args`. False when Python is not installed.
-    fn fake_helium(&mut self, code: &str, args: &[&str]) -> bool {
+    fn fake_browser(&mut self, process: &str, code: &str, args: &[&str]) -> bool {
         let paths = env::var_os("PATH").unwrap_or_default();
         let Some(python) = env::split_paths(&paths).map(|dir| dir.join("python3")).find(|path| path.is_file()) else {
-            eprintln!("skipped: no python3 for a fake Helium");
+            eprintln!("skipped: no python3 for a fake browser");
             return false;
         };
-        let helium = self.path("helium");
-        std::os::unix::fs::symlink(python, &helium).expect("link fake helium");
-        let child = Command::new(&helium)
+        let program = self.path(process);
+        std::os::unix::fs::symlink(python, &program).expect("link fake browser");
+        let child = Command::new(&program)
             .arg("-c")
             .arg(code)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start fake helium");
+            .expect("start fake browser");
         let host = fs::read_to_string("/proc/sys/kernel/hostname").expect("hostname");
         std::os::unix::fs::symlink(format!("{}-{}", host.trim(), child.id()), self.path("data/SingletonLock"))
             .expect("write SingletonLock");
@@ -137,9 +201,18 @@ impl Home {
         true
     }
 
-    /// Whether the fake Helium is still running.
+    /// Whether the fake browser is still running.
     fn fake_alive(&mut self) -> bool {
         self.browser.as_mut().is_some_and(|browser| matches!(browser.try_wait(), Ok(None)))
+    }
+
+    /// Waits until `path` exists, while the fake browser runs.
+    fn wait_for_file(&mut self, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(Instant::now() < deadline && self.fake_alive(), "{} never appeared", path.display());
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -212,16 +285,18 @@ fn a_fixed_debugging_port_is_found_from_the_browser_command_line() {
     for _ in 0..5 {
         let mut home = Home::new("fixed");
         let data = home.path("data");
+        let listening = home.path("listening");
         let port = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("address").port();
-        if !home.fake_helium(VERSION_SERVER, &[&format!("--remote-debugging-port={port}")]) {
+        let flag = format!("--remote-debugging-port={port}");
+        if !home.fake_browser("helium", VERSION_SERVER, &[&flag, listening.to_str().expect("utf-8 path")]) {
             return;
         }
         let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() && home.fake_alive() {
+        while !listening.exists() && home.fake_alive() {
             assert!(Instant::now() < deadline, "the fake Helium never listened");
             thread::sleep(Duration::from_millis(20));
         }
-        if !home.fake_alive() {
+        if !listening.exists() {
             continue; // It could not bind the port.
         }
         let url = home.ok(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data)]);
@@ -238,7 +313,7 @@ fn an_endpoint_owned_by_another_process_is_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("address").port();
     fs::write(data.join("DevToolsActivePort"), format!("{port}\n/devtools/browser/abc\n")).expect("write port file");
-    if !home.fake_helium(IDLE, &["--remote-debugging-port=0"]) {
+    if !home.fake_browser("helium", IDLE, &["--remote-debugging-port=0"]) {
         return;
     }
     let error = home.fails(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data)]);
@@ -252,7 +327,7 @@ fn an_endpoint_listening_beyond_loopback_is_refused() {
     let listener = TcpListener::bind("0.0.0.0:0").expect("bind");
     let port = listener.local_addr().expect("address").port();
     fs::write(data.join("DevToolsActivePort"), format!("{port}\n/devtools/browser/abc\n")).expect("write port file");
-    if !home.fake_helium(IDLE, &["--remote-debugging-port=0"]) {
+    if !home.fake_browser("helium", IDLE, &["--remote-debugging-port=0"]) {
         return;
     }
     let error = home.fails(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data)]);
@@ -267,6 +342,105 @@ fn no_browser_holding_the_data_dir_means_not_running() {
     fs::write(data.join("DevToolsActivePort"), "9\n/devtools/browser/abc\n").expect("write port file");
     let error = home.fails(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data)]);
     assert!(error.contains("Helium is not running"), "{error}");
+}
+
+#[test]
+fn the_configured_browser_kind_names_the_process() {
+    let mut home = Home::new("kind");
+    let data = home.path("data");
+    if !home.fake_browser("helium", IDLE, &["--remote-debugging-port=0"]) {
+        return;
+    }
+    let error =
+        home.fails(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data), ("HBA_BROWSER", Path::new("chrome"))]);
+    assert!(error.contains("Chrome is not running with user data dir"), "{error}");
+}
+
+#[test]
+fn chrome_on_its_default_data_dir_ignores_the_flag() {
+    let mut home = Home::new("chrome-default");
+    // The home's data dir stands in for Chrome's default one under XDG_CONFIG_HOME.
+    std::os::unix::fs::symlink(home.path("data"), home.path("config/google-chrome")).expect("link data dir");
+    if !home.fake_browser("chrome", IDLE, &["--remote-debugging-port=9222"]) {
+        return;
+    }
+    let error = home.fails(&["browser", "endpoint"], &[("HBA_BROWSER", Path::new("chrome"))]);
+    assert!(error.contains("Chrome ignores --remote-debugging-port on its default user data dir"), "{error}");
+    assert!(error.contains("chrome://inspect/#remote-debugging"), "{error}");
+}
+
+#[test]
+fn a_browser_without_remote_debugging_says_how_to_turn_it_on() {
+    let mut home = Home::new("off");
+    let data = home.path("data");
+    if !home.fake_browser("helium", IDLE, &[]) {
+        return;
+    }
+    let error = home.fails(&["browser", "endpoint"], &[("HBA_USER_DATA_DIR", &data)]);
+    assert!(error.contains("Helium runs without remote debugging"), "{error}");
+    assert!(error.contains("--remote-debugging-port=9222"), "{error}");
+    assert!(error.contains("chrome://inspect/#remote-debugging"), "{error}");
+}
+
+/// A home with an [`APPROVAL_BROWSER`] that has published its port; `None` without Python.
+fn approval_home(name: &str) -> Option<Home> {
+    let mut home = Home::new(name);
+    let (data, control) = (home.path("data"), home.path("control"));
+    fs::create_dir_all(&control).expect("create control dir");
+    let args = [data.to_str().expect("utf-8 path"), control.to_str().expect("utf-8 path")];
+    if !home.fake_browser("chrome", APPROVAL_BROWSER, &args) {
+        return None;
+    }
+    home.wait_for_file(&data.join("DevToolsActivePort"));
+    Some(home)
+}
+
+#[test]
+fn approval_mode_keeps_one_request_open_and_takes_a_late_allow() {
+    let Some(mut home) = approval_home("approval") else { return };
+    let (data, control) = (home.path("data"), home.path("control"));
+    let vars = [("HBA_USER_DATA_DIR", data.as_path()), ("HBA_BROWSER", Path::new("chrome"))];
+    // Without a flag, the endpoint comes from the port file, verified like any other.
+    let url = home.ok(&["browser", "endpoint"], &vars);
+    assert!(url.starts_with("ws://127.0.0.1:") && url.trim().ends_with("/devtools/browser/abc"), "{url}");
+    // The connection waits for the user's Allow for the command's timeout, not a fixed one.
+    let error = home.fails(&["--timeout", "1", "browser", "launch"], &vars);
+    assert!(error.contains("Chrome did not allow the DevTools connection within 1s; click Allow"), "{error}");
+    // The next command waits for the same request: one dialog, not one per command.
+    let report = home.ok(&["--timeout", "1", "doctor"], &vars);
+    assert!(report.contains("owned by Chrome pid") && report.contains("approval mode"), "{report}");
+    assert!(report.contains("✗ connect: Chrome did not allow"), "{report}");
+    let status = home.ok(&["daemon", "status"], &vars);
+    assert!(status.contains("waiting for Allow in Chrome's dialog"), "{status}");
+    let connections = || fs::read_to_string(control.join("connections")).expect("read the connection count");
+    assert_eq!(connections(), "1");
+    // An Allow after every command gave up still connects, and the next command uses it.
+    fs::write(control.join("allow"), "").expect("allow");
+    home.wait_for_file(&control.join("allowed"));
+    let status = home.ok(&["daemon", "status"], &vars);
+    assert!(status.contains("Chrome allowed the connection, which the next command takes"), "{status}");
+    let launched = home.ok(&["--timeout", "1", "browser", "launch"], &vars);
+    assert!(launched.starts_with("Fake/1 pid "), "{launched}");
+    assert_eq!(connections(), "1");
+}
+
+#[test]
+fn a_daemon_stopped_while_its_request_waits_stays_for_the_answer() {
+    let Some(home) = approval_home("stop-pending") else { return };
+    let (data, control) = (home.path("data"), home.path("control"));
+    let vars = [("HBA_USER_DATA_DIR", data.as_path()), ("HBA_BROWSER", Path::new("chrome"))];
+    home.fails(&["--timeout", "1", "browser", "launch"], &vars);
+    // Closing the request would leave its dialog in front of the next daemon's, where Allow
+    // connects nothing.
+    let stopping = home.ok(&["daemon", "stop"], &vars);
+    assert!(stopping.contains("daemon stopping once you answer Chrome's"), "{stopping}");
+    home.wait_for_log("waiting for the answer to the approval request before exiting");
+    fs::write(control.join("allow"), "").expect("allow");
+    // The next daemon starts once the old one has its answer, asks once and connects.
+    let launched = home.ok(&["--timeout", "5", "browser", "launch"], &vars);
+    assert!(launched.starts_with("Fake/1 pid "), "{launched}");
+    assert_eq!(fs::read_to_string(control.join("connections")).expect("read the connection count"), "2");
+    assert!(!home.path("runtime/hba/abandoned-approval").exists(), "no request was left unanswered");
 }
 
 #[test]

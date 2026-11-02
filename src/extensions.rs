@@ -246,27 +246,42 @@ async fn load(cx: &mut Cx<'_>, scope: &Scope, dir: &Path) -> Result<()> {
         None => Vec::new(),
     };
     let installed = scope.browser.cdp.call::<Installed>("Extensions.loadUnpacked", json!({"path": path}), None).await;
+    let name = scope.browser.config().browser.name();
     let id = match installed {
         Ok(installed) => installed.id,
-        Err(error) => bail!("Helium did not load {}: {}", tilde(&dir), error.root_cause()),
+        Err(error) => {
+            let reason = error.root_cause().to_string();
+            // Chromium before 149 offers the method only over `--remote-debugging-pipe` with
+            // `--enable-unsafe-extension-debugging`; elsewhere it is missing or not available.
+            if reason.contains("wasn't found") || reason.contains("not available") {
+                bail!(
+                    "{name} does not let DevTools load unpacked extensions ({reason}); that needs Chromium 149 or \
+                     newer (older Chrome only with --remote-debugging-pipe and --enable-unsafe-extension-debugging), \
+                     or load {} by hand at {}://extensions with developer mode on",
+                    tilde(&dir),
+                    scope.browser.config().browser.scheme()
+                );
+            }
+            bail!("{name} did not load {}: {reason}", tilde(&dir));
+        }
     };
-    // The session's profile may not be the one Helium installed into, so ask the browser.
+    // The session's profile may not be the one the browser installed into, so ask the browser.
     let mut now = Vec::new();
     catalog::merge_loaded(&mut now, loaded(&scope.browser).await?);
     let ext = now
         .into_iter()
         .find(|known| known.id == id)
-        .with_context(|| format!("Helium loaded {id} but does not list it"))?;
+        .with_context(|| format!("{name} loaded {id} but does not list it"))?;
     let replaced = before.iter().any(|known| known.id == id);
     cx.say(format!(
-        "{} {} {} — {id} (until Helium restarts)",
+        "{} {} {} — {id} (until {name} restarts)",
         if replaced { "reloaded" } else { "loaded" },
         ext.name(),
         ext.manifest.version
     ));
     if scope.profile != scope.default {
         cx.say(format!(
-            "note: Helium installs unpacked extensions in its default profile {:?}; this session uses {:?}",
+            "note: {name} installs unpacked extensions in its default profile {:?}; this session uses {:?}",
             scope.default.name, scope.profile.name
         ));
     }
@@ -407,9 +422,10 @@ async fn errors(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension, clear: bool) ->
         (_, false) => format!("{count} error{plural} recorded for {}", ext.name()),
     });
     if report.enabled_developer_mode {
-        cx.say(
-            "turned on developer mode: Helium records runtime errors only in developer mode, so earlier ones were not kept; reproduce the problem and run this again",
-        );
+        cx.say(format!(
+            "turned on developer mode: {} records runtime errors only in developer mode, so earlier ones were not kept; reproduce the problem and run this again",
+            scope.browser.config().browser.name()
+        ));
     }
     if clear {
         return Ok(());

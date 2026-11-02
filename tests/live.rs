@@ -1,7 +1,9 @@
-//! End-to-end tests against a throwaway headless Helium. They never touch the user's browser.
+//! End-to-end tests against a throwaway headless browser. They never touch the user's browser.
 //!
 //! Run with `HBA_LIVE=1 cargo test --test live`. `HBA_HELIUM` overrides the browser binary
-//! (default `/opt/helium-browser-bin/helium`). Without `HBA_LIVE` the suite is skipped.
+//! (default `/opt/helium-browser-bin/helium`); for another browser set `HBA_BROWSER` too, e.g.
+//! `HBA_BROWSER=chrome HBA_HELIUM=/opt/google/chrome/chrome`. Without `HBA_LIVE` the suite is
+//! skipped.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,7 +12,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-/// A headless Helium, a fixture web server and an isolated hba daemon; torn down on drop.
+/// A headless browser, a fixture web server and an isolated hba daemon; torn down on drop.
 struct Rig {
     root: PathBuf,
     site: String,
@@ -46,14 +48,14 @@ impl Rig {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start headless Helium (set HBA_HELIUM)");
+            .expect("start the headless browser (set HBA_HELIUM)");
         let site = serve(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site"));
         // Built before waiting so a startup failure still tears the browser down.
         let rig = Self { root, site, browser };
         let port_file = rig.root.join("profile/DevToolsActivePort");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !port_file.exists() {
-            assert!(Instant::now() < deadline, "Helium did not open a DevTools port");
+            assert!(Instant::now() < deadline, "the browser did not open a DevTools port");
             thread::sleep(Duration::from_millis(50));
         }
         // While a fresh profile's bundled uBlock Origin starts, it holds the requests it sees and

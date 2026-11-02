@@ -1,13 +1,14 @@
 ---
 name: hba
-description: "Drive the user's own running Helium browser (logged-in profiles) from the shell: open, read, click, fill, tabs, screenshots, console/network/performance, and extension development (load, reload, logs, errors, popup, storage). Use for any browser task that needs real interaction, the user's sessions, or Chromium DevTools."
+description: "Drive the user's own running browser (Helium, Chrome or Brave, with their logged-in profiles) from the shell: open, read, click, fill, tabs, screenshots, console/network/performance, and extension development (load, reload, logs, errors, popup, storage). Use for any browser task that needs real interaction, the user's sessions, or Chromium DevTools."
 ---
 
-# hba — the user's Helium, from the shell
+# hba — the user's browser, from the shell
 
-`hba` talks to the user's running Helium over DevTools through a background daemon (each call
-takes milliseconds). It works in **its own tabs** in the user's real, logged-in profiles. A plain
-public fetch needs no browser: use your fetch/read tool for that.
+`hba` talks to the user's running browser (Helium by default; Chrome or Brave when configured)
+over DevTools through a background daemon (each call takes milliseconds). It works in **its own
+tabs** in the user's real, logged-in profiles. A plain public fetch needs no browser: use your
+fetch/read tool for that.
 
 ## The loop
 ```sh
@@ -74,7 +75,7 @@ fails with the blocker's description (`click --force` skips the checks). `click`
 - `hba perf metrics|vitals`, `perf trace start` … `perf trace stop t.json` (DevTools Performance),
   `perf profile start|stop`, `perf heap`, `perf coverage start|stop`.
 - `hba shot [path] [--full] [-e e5] [-a]` (`-a` labels refs on the image), `hba pdf`. Shots work while
-  Helium's window is hidden; only captures past the viewport (`--full`, a tall `-e`) need it on screen.
+  the browser's window is hidden; only captures past the viewport (`--full`, a tall `-e`) need it on screen.
 - `hba emulate --device 'iPhone 15' | --viewport 390x844 --dpr 3 --mobile | --tz Asia/Tokyo |
   --locale de-DE | --geo 48.85,2.35 | --scheme dark | --network slow3g | --cpu 4`; `--reset`.
 - `hba cookies`, `hba storage [local|session] …`, `hba state save|load f.json`, `hba perms grant geolocation`.
@@ -83,7 +84,7 @@ fails with the blocker's description (`click --force` skips the checks). `click`
 
 ## Extension development
 ```sh
-hba ext load ./dist             # installs the unpacked extension (until Helium restarts)
+hba ext load ./dist             # installs the unpacked extension (until the browser restarts)
 hba ext                         # extensions, versions, service-worker state
 hba ext reload my-ext           # after a rebuild; id, name or directory
 hba ext logs my-ext             # service-worker/page console (capture starts on first call)
@@ -104,3 +105,12 @@ hba js --world my-ext 'window.contentState'   # in the content script's world (t
   usage.
 - Login walls, MFA, captchas, purchases and anything irreversible: stop and ask the user.
 - `hba doctor` diagnoses connection problems; `hba browser launch|restart|endpoint`.
+- **Approval mode** (Chrome's own profile, or any browser whose remote debugging was turned on at
+  `chrome://inspect/#remote-debugging` instead of with a flag): the browser asks the user to allow
+  each new DevTools connection and shows an automation notice while `hba` is connected. A command
+  failing with "did not allow the DevTools connection … click Allow" means the dialog is waiting:
+  ask the user to click Allow, then run the command again (`--timeout 120` gives them longer). The
+  request stays open after a command gives up, so an Allow clicked later still counts; don't
+  restart anything, and don't run `hba daemon stop` to "retry": every abandoned request leaves a
+  dead dialog in front of the next one. One Allow lasts as long as the `hba` daemon runs, which
+  in this mode does not exit for idleness.

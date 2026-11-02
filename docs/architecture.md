@@ -7,29 +7,54 @@
 - **Client.** Each command is a short-lived process. It parses the arguments, reads stdin for `-`
   arguments and `run` scripts, sends one JSON request line over `$XDG_RUNTIME_DIR/hba/hba.sock`, and
   prints the one JSON reply line. It starts the daemon when no socket answers.
-- **Daemon.** A background `hba` with one DevTools WebSocket to Helium. It keeps sessions, attached
-  tabs, their isolated worlds and event buffers (console, network, downloads) warm, so a command
-  costs milliseconds instead of a browser connection. Commands of one session run in order;
-  different sessions run concurrently. A client that goes away (Ctrl-C, an agent's timeout)
+- **Daemon.** A background `hba` with one DevTools WebSocket to the browser. It keeps sessions,
+  attached tabs, their isolated worlds and event buffers (console, network, downloads) warm, so a
+  command costs milliseconds instead of a browser connection. Commands of one session run in
+  order; different sessions run concurrently. A client that goes away (Ctrl-C, an agent's timeout)
   cancels its command, and whatever the command switched on (interception, `Runtime`, helper tabs)
   is switched off again; `drag`, `browser restart` and the commands that stop a recording and save
-  it run to completion. The daemon exits after `idle_minutes`, on `hba daemon stop`, or when a
-  client of a different build or `HBA_*` environment connects. On the way out it stops accepting
-  connections and finishes the commands in flight (up to a minute); a new daemon takes over as
-  soon as the old one releases its lock.
+  it run to completion. The daemon exits after `idle_minutes` (in approval mode not while it holds
+  a connection or a request awaiting Allow), on `hba daemon stop`, or when a client of a different
+  build or `HBA_*` environment connects. On the way out it stops accepting connections and
+  finishes the commands in flight, and in approval mode waits for the answer to an unanswered
+  request (up to a minute in all); a new daemon takes over as soon as the old one releases its
+  lock.
 
 ## Connecting
 
-The browser is the Helium process named in the `SingletonLock` link that Chromium keeps in the user
-data directory while it runs. Its DevTools port is the `--remote-debugging-port` on its command line;
-only for port 0 does Helium write the chosen port to `DevToolsActivePort`, which is then used. Before
-connecting, `hba` reads `/proc/net/tcp*` to check that the port listens on loopback only and that
-process's `/proc/PID/fd` to check that it holds the listening socket. The browser's WebSocket URL
-comes from `/json/version` for a fixed port and from `DevToolsActivePort` for port 0. A port exposed
-beyond loopback, or owned by anything else, is refused; a port file without its browser is ignored.
+The browser is Helium, Chrome or Brave (`browser` in the configuration); its process is the one
+of that name (`helium`, `chrome`, `brave`) named in the `SingletonLock` link that Chromium keeps in
+the user data directory while it runs. How it serves DevTools follows from its command line:
 
-The daemon enables target discovery for pages and tabs only, and `Browser` download events (Helium's
-download settings stay as they are).
+- **`--remote-debugging-port=N`.** The port is `N`, and the WebSocket URL comes from
+  `/json/version`. For port 0 the browser writes the chosen port and URL path to
+  `DevToolsActivePort`, which is used instead.
+- **No flag: approval mode.** Remote debugging was turned on with the switch at
+  `chrome://inspect/#remote-debugging`, which Chromium keeps in `Local State`
+  (`devtools.remote_debugging.user-enabled`). The browser listens on a loopback port it writes to
+  `DevToolsActivePort`, answers `/json/version` with nothing, and holds each WebSocket handshake
+  until its user answers an "Allow remote debugging?" dialog (Cancel answers 403). Chrome shows
+  one dialog per request, one at a time and oldest first, and closing a request does not close
+  its dialog: Allow on it then connects nothing, and the live request's dialog waits behind it
+  (observed on Chrome 156; Chromium's `DevToolsConnectionDialog` has no cancel path). So the
+  daemon never abandons a request: it runs the handshake on a task of its own and keeps exactly
+  one; a command waits for it up to its timeout (other connections get 5 s) and then says to
+  click Allow, while the handshake goes on, so a late Allow connects and the next command takes
+  the connection. Commands that come meanwhile wait for the same handshake. A daemon that exits
+  with the request still unanswered records it (`abandoned-approval` in the runtime directory),
+  and the next daemon's messages say to Cancel the first dialog. Chrome shows its "being
+  controlled by automated test software" bar while connected; `navigator.webdriver` stays false
+  (checked on Chrome 156).
+- **Chrome on its default data directory** ignores the flag (Chrome 136 and later) and then
+  starts no DevTools server at all, not even the switch's; `hba` says to remove the flag.
+
+Before connecting, `hba` reads `/proc/net/tcp*` to check that the port listens on loopback only and
+that process's `/proc/PID/fd` to check that it holds the listening socket, in both modes. A port
+exposed beyond loopback, or owned by anything else, is refused; a port file without its browser
+is ignored.
+
+The daemon enables target discovery for pages and tabs only, and `Browser` download events (the
+browser's download settings stay as they are).
 
 ## Tabs and pages
 
@@ -49,11 +74,11 @@ Workers and other children are released immediately.
   and get focus emulation, so they keep rendering, running timers and taking screenshots without
   being shown. Tabs opened by an agent tab (popups, `target=_blank`) join its session, and the tab
   the user was looking at is shown again.
-- **Profiles.** Each Helium profile is a browser context. `hba` learns which context is which
-  profile by reading `chrome://version` in a short-lived probe tab, once per profile. New tabs are
-  created in the profile's context over DevTools; Helium accepts that only for the last-used
-  profile, so for the others `hba` opens a marked tab through the launcher
-  (`--profile-directory`) and restores the focused window on niri.
+- **Profiles.** Each profile is a browser context. `hba` learns which context is which profile by
+  reading `chrome://version` in a short-lived probe tab, once per profile. New tabs are created in
+  the profile's context over DevTools; Chromium accepts that only for the last-used profile, so
+  for the others `hba` opens a marked tab through the launcher (`--profile-directory`) and
+  restores the focused window on niri.
 
 ## Sessions and ownership
 
@@ -90,10 +115,11 @@ click point; a covering element is named in the error. Then:
 - **Input** is trusted `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent` events with
   Playwright's US keyboard layout. On websites (`humanize = auto`) the pointer moves along a curve
   with eased, jittered steps, clicks land off-center and typing has per-key delays; local pages get
-  instant input. Pointer moves are sent without waiting for each to be taken: while Helium's window
-  is off screen, the page takes a lone move only with its next frame, about a second later, but at
-  once when another event follows. Scrolling uses the wheel when the window is on screen, the page
-  is painting and the pointer is over the scroller, and scrolls directly otherwise.
+  instant input. Pointer moves are sent without waiting for each to be taken: while the browser's
+  window is off screen, the page takes a lone move only with its next frame, about a second
+  later, but at once when another event follows. Scrolling uses the wheel when the window is on
+  screen, the page is painting and the pointer is over the scroller, and scrolls directly
+  otherwise.
 - **Settling.** After an action, `hba` waits until the DOM has been quiet for 100 ms and no
   document, fetch or XHR request started by the action is in flight (at most 1.5 s), and follows
   a navigation the action started. A link that opens another tab is not followed, and a
@@ -122,8 +148,9 @@ What a page could notice is kept to what a person's browser does anyway.
   any domain.
 - Input is real input, human-paced on websites.
 - The browser is the user's own: no automation flags, the user's profile, extensions and
-  fingerprint, and with a fixed debugging port no `navigator.webdriver` (port 0 sets it, which
-  `hba doctor` reports).
+  fingerprint, and with a fixed debugging port or in approval mode no `navigator.webdriver` (port
+  0 sets it, which `hba doctor` reports). In approval mode Chrome shows its automation bar while
+  `hba` is connected; the user turned that mode on and sees it.
 - Emulation and interception apply to the tab's protocol sessions and vanish when `hba` detaches;
   `Fetch` is enabled only while block or mock rules exist. Permission overrides (`perms grant`,
   `emulate --geo`) apply to the whole profile and shadow its own settings. Once no tab `hba` holds
@@ -139,27 +166,29 @@ What a page could notice is kept to what a person's browser does anyway.
 The `Network` and `Page` domains are on for every attached tab (they are invisible to pages), which
 gives the request log, failed requests and response bodies. `perf metrics` turns `Performance` on at
 first use and leaves it on; traces, CPU profiles, heap snapshots and coverage use their domains
-only while recording. `hba devtools` opens Helium's own developer tools window for a human.
+only while recording. `hba devtools` opens the browser's own developer tools window for a human.
 
 A screenshot captures the whole view, and `hba` cuts out the requested part, so Chromium does not
-resize the view for it. The view comes from the compositor surface while Helium's window is on
-screen (about 0.1 s). While it is not (another niri workspace, minimized), Helium draws no surface,
-so `hba` grabs the view instead (about 1.5 s). Content beyond the viewport (`--full` on a long page,
-an element taller than the view) needs a clipped capture, which Chromium renders by resizing the
-view, and the window on screen. Whether the window is on screen comes from niri; elsewhere a surface
-capture that does not answer falls back to the grab. When only some of Helium's windows are on
-screen, or without niri, a capture beyond the viewport first checks with a quick viewport capture
-and fails within about 4 s if Helium does not draw the tab.
+resize the view for it. The view comes from the compositor surface while the browser's window is
+on screen (about 0.1 s). While it is not (another niri workspace, minimized), the browser draws no
+surface, so `hba` grabs the view instead (about 1.5 s). Content beyond the viewport (`--full` on a
+long page, an element taller than the view) needs a clipped capture, which Chromium renders by
+resizing the view, and the window on screen. Whether the window is on screen comes from niri;
+elsewhere a surface capture that does not answer falls back to the grab. When only some of the
+browser's windows are on screen, or without niri, a capture beyond the viewport first checks with
+a quick viewport capture and fails within about 4 s if the browser does not draw the tab.
 
 ## Extensions
 
-- `ext load` and `ext rm` use the `Extensions` domain (Chromium 149+), which installs an unpacked
-  extension into the default (last-used) profile until Helium restarts.
+- `ext load` and `ext rm` use the `Extensions` domain, which installs an unpacked extension into
+  the default (last-used) profile until the browser restarts. Since Chromium 149 it works over the
+  WebSocket without `--remote-debugging-pipe` or `--enable-unsafe-extension-debugging` (verified
+  on Helium 156 and Chrome 156); a browser that refuses it gets an error naming that requirement.
 - `ext eval`, `ext logs` and `ext sw` attach to the extension's service worker, background page or
   extension pages. An attached debugger keeps a service worker running, as DevTools does; captured
   logs continue across worker restarts and reloads.
-- `ext errors` and `ext reload` use Helium's extension manager API from a hidden
-  `chrome://extensions` page. Helium records runtime errors only in developer mode, which
+- `ext errors` and `ext reload` use the browser's extension manager API from a hidden
+  `chrome://extensions` page. Chromium records runtime errors only in developer mode, which
   `ext errors` turns on when needed and says so.
 - `ext popup` opens the popup page in a session tab, so it can be read and driven like any page;
   an action without a popup is triggered on the current tab.

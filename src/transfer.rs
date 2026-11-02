@@ -2,7 +2,7 @@
 //!
 //! Uploads set the files of a file input directly, or answer the file chooser an element opens.
 //! Drags press at the source and move to the destination in steps, which drives mouse-based
-//! drag libraries; when the page starts an HTML5 drag, Helium hands the drag data over and the
+//! drag libraries; when the page starts an HTML5 drag, the browser hands the drag data over and the
 //! drop happens through `Input.dispatchDragEvent`, as in Playwright.
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use crate::undo::Undo;
 /// each step.
 const STEP_PAUSE: Duration = Duration::from_millis(16);
 
-/// How long Helium may take to hand over a drag the page started.
+/// How long the browser may take to hand over a drag the page started.
 const DRAG_HANDOVER: Duration = Duration::from_secs(2);
 
 /// How long actions wait for an element to become actionable (as `actions` does).
@@ -206,7 +206,7 @@ pub async fn drag(cx: &mut Cx<'_>, args: DragArgs) -> Result<()> {
 
 /// Presses at `from`, moves to the destination in steps and drops there. Mouse events carry the
 /// pressed button, so pointer-driven drag libraries follow; once the page starts an HTML5 drag,
-/// the remaining steps are drag events with the data Helium handed over.
+/// the remaining steps are drag events with the data the browser handed over.
 async fn drag_to(
     page: &Page,
     source: &World,
@@ -280,7 +280,7 @@ async fn handed_over(page: &Page, source: &World, signals: &mut broadcast::Recei
         return Ok(None);
     }
     let data = next_signal(signals, DRAG_HANDOVER, intercepted).await;
-    data.map(Some).context("the page started a drag, but Helium did not hand it over")
+    data.map(Some).context("the page started a drag, but the browser did not hand it over")
 }
 
 /// A left-button mouse event at `point`; `buttons` is 1 while the button is held.

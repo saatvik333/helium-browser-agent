@@ -18,11 +18,80 @@ pub enum Humanize {
     Never,
 }
 
+/// The Chromium browser `hba` drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserKind {
+    Helium,
+    Chrome,
+    Brave,
+}
+
+impl BrowserKind {
+    /// Its name in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Helium => "Helium",
+            Self::Chrome => "Chrome",
+            Self::Brave => "Brave",
+        }
+    }
+
+    /// The browser process's `/proc/PID/comm`.
+    pub fn process(self) -> &'static str {
+        match self {
+            Self::Helium => "helium",
+            Self::Chrome => "chrome",
+            Self::Brave => "brave",
+        }
+    }
+
+    /// Default user data directory, under `$XDG_CONFIG_HOME`.
+    fn data_dir(self) -> &'static str {
+        match self {
+            Self::Helium => "net.imput.helium",
+            Self::Chrome => "google-chrome",
+            Self::Brave => "BraveSoftware/Brave-Browser",
+        }
+    }
+
+    fn launcher(self) -> &'static str {
+        match self {
+            Self::Helium => "helium-browser",
+            Self::Chrome => "google-chrome-stable",
+            Self::Brave => "brave",
+        }
+    }
+
+    /// File of extra command-line flags its launcher reads, under `$XDG_CONFIG_HOME`.
+    fn flags_file(self) -> &'static str {
+        match self {
+            Self::Helium => "helium-browser-flags.conf",
+            Self::Chrome => "chrome-flags.conf",
+            Self::Brave => "brave-flags.conf",
+        }
+    }
+
+    /// Scheme of its internal pages (`chrome://extensions`).
+    pub fn scheme(self) -> &'static str {
+        match self {
+            Self::Helium | Self::Chrome => "chrome",
+            Self::Brave => "brave",
+        }
+    }
+
+    /// The page with the "Allow remote debugging for this browser instance" switch.
+    pub fn inspect_page(self) -> String {
+        format!("{}://inspect/#remote-debugging", self.scheme())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Helium's user data directory (holds `Local State` and the running Helium's `SingletonLock`).
+    pub browser: BrowserKind,
+    /// The browser's user data directory (holds `Local State` and the running browser's `SingletonLock`).
     pub user_data_dir: PathBuf,
-    /// Executable that starts Helium or opens a profile window in the running instance.
+    /// Executable that starts the browser or opens a profile window in the running instance.
     pub launcher: PathBuf,
     /// Profile for new tabs when no flag, environment or workspace rule picks one.
     pub default_profile: Option<String>,
@@ -35,12 +104,15 @@ pub struct Config {
     pub humanize: Humanize,
     /// Explicit DevTools WebSocket URL; skips discovery and owner verification.
     pub cdp_url: Option<String>,
+    /// `user_data_dir` is the browser's default one.
+    default_data_dir: bool,
     source: Option<(PathBuf, SystemTime)>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    browser: Option<BrowserKind>,
     user_data_dir: Option<String>,
     launcher: Option<String>,
     default_profile: Option<String>,
@@ -87,10 +159,21 @@ impl Config {
     fn from_file(file: File, source: Option<(PathBuf, SystemTime)>) -> Result<Self> {
         // Errors about a key of the file name the file too.
         let at = source.as_ref().map_or_else(String::new, |(path, _)| format!(" in {}", path.display()));
+        let browser = match env::var("HBA_BROWSER") {
+            Ok(value) => match value.as_str() {
+                "helium" => BrowserKind::Helium,
+                "chrome" => BrowserKind::Chrome,
+                "brave" => BrowserKind::Brave,
+                _ => bail!("HBA_BROWSER must be helium, chrome or brave"),
+            },
+            Err(_) => file.browser.unwrap_or(BrowserKind::Helium),
+        };
+        let default_dir = xdg("XDG_CONFIG_HOME", ".config").join(browser.data_dir());
         let user_data_dir = setting("HBA_USER_DATA_DIR", file.user_data_dir, "user_data_dir", &at)?
-            .map_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("net.imput.helium"), |dir| expand(&dir));
+            .map_or_else(|| default_dir.clone(), |dir| expand(&dir));
+        let default_data_dir = normalize(&user_data_dir) == normalize(&default_dir);
         let launcher = setting("HBA_LAUNCHER", file.launcher, "launcher", &at)?
-            .map_or_else(|| PathBuf::from("helium-browser"), |path| expand(&path));
+            .map_or_else(|| PathBuf::from(browser.launcher()), |path| expand(&path));
         let humanize = match env::var("HBA_HUMANIZE") {
             Ok(value) => match value.as_str() {
                 "auto" => Humanize::Auto,
@@ -134,6 +217,7 @@ impl Config {
             )),
         };
         Ok(Self {
+            browser,
             user_data_dir,
             launcher,
             default_profile: file.default_profile,
@@ -142,6 +226,7 @@ impl Config {
             idle,
             humanize,
             cdp_url,
+            default_data_dir,
             source,
         })
     }
@@ -150,6 +235,18 @@ impl Config {
     pub fn workspace_profile(&self, cwd: &Path) -> Option<&str> {
         let cwd = normalize(cwd);
         self.workspaces.iter().find(|(dir, _)| cwd.starts_with(dir)).map(|(_, profile)| profile.as_str())
+    }
+
+    /// Whether the browser ignores `--remote-debugging-port`: Chrome 136 and later does on its
+    /// default user data directory, and then starts no DevTools server at all, not even the one
+    /// its remote debugging switch turns on.
+    pub fn ignores_port_flag(&self) -> bool {
+        self.browser == BrowserKind::Chrome && self.default_data_dir
+    }
+
+    /// The file of extra flags the browser's launcher reads.
+    pub fn flags_file(&self) -> PathBuf {
+        xdg("XDG_CONFIG_HOME", ".config").join(self.browser.flags_file())
     }
 }
 
@@ -261,5 +358,26 @@ mod tests {
         let source = Some((PathBuf::from("/srv/hba.toml"), SystemTime::UNIX_EPOCH));
         let error = Config::from_file(file, source).unwrap_err().to_string();
         assert_eq!(error, "aliases.\"work\" in /srv/hba.toml needs a non-empty name and profile");
+    }
+
+    #[test]
+    fn each_browser_has_its_own_defaults() {
+        let helium = config("").unwrap();
+        assert_eq!(helium.browser, BrowserKind::Helium);
+        assert_eq!(helium.user_data_dir, xdg("XDG_CONFIG_HOME", ".config").join("net.imput.helium"));
+        assert!(!helium.ignores_port_flag());
+        let chrome = config("browser = 'chrome'").unwrap();
+        assert_eq!(chrome.user_data_dir, xdg("XDG_CONFIG_HOME", ".config").join("google-chrome"));
+        assert_eq!(chrome.launcher, Path::new("google-chrome-stable"));
+        assert!(chrome.ignores_port_flag(), "Chrome ignores the flag on its default data dir");
+        let throwaway =
+            config("browser = 'chrome'\nuser_data_dir = '/srv/chrome-test'\nlauncher = '/srv/chrome'").unwrap();
+        assert!(!throwaway.ignores_port_flag());
+        assert_eq!(throwaway.launcher, Path::new("/srv/chrome"));
+        let brave = config("browser = 'brave'").unwrap();
+        assert_eq!(brave.user_data_dir, xdg("XDG_CONFIG_HOME", ".config").join("BraveSoftware/Brave-Browser"));
+        assert!(!brave.ignores_port_flag());
+        let error = config("browser = 'firefox'").unwrap_err().to_string();
+        assert!(error.contains("expected one of `helium`, `chrome`, `brave`"), "{error}");
     }
 }

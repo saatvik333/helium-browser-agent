@@ -441,9 +441,9 @@ async fn relayout(page: &Page, world: &World, size: &Value) {
 }
 
 /// What [`take`] says when only the viewport can be captured.
-const NOT_SHOWN: &str = "Helium's window is not on screen (minimized or on another workspace), so only what fits \
-                         in the viewport can be captured; show the window, or capture the viewport (`hba scroll` \
-                         moves it)";
+const NOT_SHOWN: &str = "the browser's window is not on screen (minimized or on another workspace), so only what \
+                         fits in the viewport can be captured; show the window, or capture the viewport (`hba \
+                         scroll` moves it)";
 
 fn decode(data: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(data).context("decoding the screenshot")
@@ -745,7 +745,7 @@ pub async fn pdf(cx: &mut Cx<'_>, args: PdfArgs) -> Result<()> {
                         "paperHeight": height, "transferMode": "ReturnAsStream"});
     let printed =
         page.cdp.raw_within("Page.printToPDF", &params, Some(&session), cx.timeout).await.context("printing to PDF")?;
-    let printed: Printed = serde_json::from_str(printed.get()).context("Helium returned no PDF stream")?;
+    let printed: Printed = serde_json::from_str(printed.get()).context("the browser returned no PDF stream")?;
     let written = save_stream(&page.cdp, &session, &printed.stream, file, &path).await?;
     let orientation = if args.landscape { " landscape" } else { "" };
     cx.say(format!("{} ({paper_name}{orientation}, {})", path.display(), crate::output::bytes(written)));

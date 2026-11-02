@@ -249,6 +249,7 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
         (Arc::clone(&trace.session), trace.started)
     };
     let path = output_path(cx, path, "trace", "json")?;
+    let name = cx.config()?.browser.name();
     // Ending the trace is final, so the file is opened first.
     let file = output::create(&path)?;
     let traced = started.elapsed();
@@ -267,7 +268,7 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
             page.cdp.send("Tracing.end", json!({}), Some(&session)).await?;
             let stream = tokio::time::timeout(timeout, complete)
                 .await
-                .context("Helium did not finish the trace in time; retry with a larger --timeout")?
+                .with_context(|| format!("{name} did not finish the trace in time; retry with a larger --timeout"))?
                 .context("the tab went away before the trace finished")?
                 .context("the trace came back without data")?;
             crate::media::save_stream(&page.cdp, &session, &stream, file, &saved_to).await

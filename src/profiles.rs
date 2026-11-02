@@ -1,4 +1,4 @@
-//! Helium profiles from `Local State`: display names, directories and which are open.
+//! Browser profiles from `Local State`: display names, directories and which are open.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,9 +25,9 @@ impl fmt::Display for Profile {
 pub struct Profiles {
     /// Sorted by directory.
     pub list: Vec<Profile>,
-    /// Directory of the profile Helium used last.
+    /// Directory of the profile the browser used last.
     pub last_used: Option<String>,
-    /// Directories Helium had open when it last saved its state.
+    /// Directories the browser had open when it last saved its state.
     pub open: Vec<String>,
 }
 
@@ -112,13 +112,13 @@ impl Profiles {
             }
         }
         bail!(
-            "no Helium profile matches {query:?}; profiles: {}",
+            "no profile matches {query:?}; profiles: {}",
             self.list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
         )
     }
 
     /// The profile for new tabs: the first of an explicit choice (`-p`), the session's earlier
-    /// profile, a workspace or default rule, and Helium's last-used profile.
+    /// profile, a workspace or default rule, and the browser's last-used profile.
     pub fn choose(
         &self,
         flag: Option<&str>,
@@ -139,7 +139,7 @@ impl Profiles {
             .as_deref()
             .and_then(|dir| self.by_dir(dir))
             .or(self.list.first())
-            .context("Helium has no profiles")
+            .context("the browser has no profiles")
     }
 }
 

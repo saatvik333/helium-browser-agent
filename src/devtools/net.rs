@@ -294,10 +294,10 @@ async fn fetch_body(page: &Page, request: &Request, timeout: Duration) -> Result
         )
         .await
         .map_err(|error| {
-            // Helium answers with an error once it dropped the body; a timeout is just slow.
+            // The browser answers with an error once it dropped the body; a timeout is just slow.
             if error.is::<crate::cdp::ProtocolError>() {
                 error.context(format!(
-                    "the body of #{} is no longer available (Helium keeps recent bodies only)",
+                    "the body of #{} is no longer available (the browser keeps recent bodies only)",
                     request.id
                 ))
             } else {

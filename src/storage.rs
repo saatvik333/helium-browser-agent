@@ -347,7 +347,7 @@ struct Cookies {
     cookies: Vec<Cookie>,
 }
 
-/// Cookies Helium sends to `url`.
+/// Cookies the browser sends to `url`.
 async fn cookies_for(page: &Page, url: &str) -> Result<Vec<Cookie>> {
     let session = page.session()?;
     let found: Cookies = page.cdp.call("Network.getCookies", json!({"urls": [url]}), Some(&session)).await?;
@@ -412,7 +412,10 @@ pub async fn cookies(cx: &mut Cx<'_>, args: CookiesArgs) -> Result<()> {
             let stored = site_cookies(&page, &host).await?;
             let path = path.as_deref().unwrap_or("/");
             let Some(cookie) = stored.iter().find(|cookie| cookie.name == name && cookie.path == path) else {
-                bail!("Helium did not keep cookie {name} (an expiry in the past, or SameSite=None without --secure)");
+                bail!(
+                    "{} did not keep cookie {name} (an expiry in the past, or SameSite=None without --secure)",
+                    cx.config()?.browser.name()
+                );
             };
             cx.say(format!("set {}", cookie.line()));
         }

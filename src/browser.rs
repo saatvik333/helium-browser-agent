@@ -91,13 +91,14 @@ struct Created {
 }
 
 impl Browser {
-    pub async fn connect(
+    /// Sets up the browser behind a new DevTools connection to `endpoint`: its version, target
+    /// discovery and download events.
+    pub async fn start(
         config: Arc<Config>,
         world: Arc<crate::injected::Source>,
-        profile: Option<&str>,
+        endpoint: Endpoint,
+        (cdp, events_rx): (Cdp, mpsc::UnboundedReceiver<Event>),
     ) -> Result<Arc<Self>> {
-        let endpoint = endpoint::ensure_running(&config, profile).await?;
-        let (cdp, events_rx) = Cdp::connect(&endpoint.ws_url).await?;
         let version: Version = cdp.call("Browser.getVersion", json!({}), None).await?;
         let (events, _) = broadcast::channel(256);
         let browser = Arc::new(Self {
@@ -120,7 +121,7 @@ impl Browser {
                 None,
             )
             .await?;
-        // Downloads keep Helium's own policy; events report where files land.
+        // Downloads keep the browser's own policy; events report where files land.
         browser
             .cdp
             .send("Browser.setDownloadBehavior", json!({"behavior": "default", "eventsEnabled": true}), None)
@@ -329,7 +330,7 @@ impl Browser {
                 break tab;
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("Helium did not open a tab in profile {:?}", profile.name);
+                bail!("{} did not open a tab in profile {:?}", self.config.browser.name(), profile.name);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };

@@ -1,4 +1,4 @@
-//! `hba`: drive your running Helium browser from the command line.
+//! `hba`: drive your running Helium, Chrome or Brave from the command line.
 //!
 //! One binary: a short-lived client per command and a background daemon that keeps the
 //! DevTools connection, sessions and attached tabs warm.

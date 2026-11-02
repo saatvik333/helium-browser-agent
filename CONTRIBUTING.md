@@ -1,13 +1,15 @@
 # Contributing
 
 Start with the README and [architecture](docs/architecture.md). Describe the concrete failure or
-behavior you want to change, with the Helium version (`hba doctor`) and the commands that show it.
+behavior you want to change, with the browser and its version (`hba doctor`) and the commands that
+show it.
 
 ```sh
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
 HBA_LIVE=1 cargo test --test live    # starts its own headless Helium; never touches yours
+HBA_LIVE=1 HBA_BROWSER=chrome HBA_HELIUM=/opt/google/chrome/chrome cargo test --test live   # against Chrome
 ```
 
 - Fix a bug with a test that fails without the fix: a unit test for pure logic, `tests/cli.rs` for

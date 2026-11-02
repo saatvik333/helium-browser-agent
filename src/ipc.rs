@@ -21,8 +21,16 @@ pub const DAEMON_DRAIN: Duration = Duration::from_secs(60);
 
 /// Variables the daemon reads once when it starts. A client whose values differ gets a fresh
 /// daemon instead of one that would silently ignore them.
-const DAEMON_ENV: [&str; 7] =
-    ["HBA_CONFIG", "HBA_USER_DATA_DIR", "HBA_LAUNCHER", "HBA_HUMANIZE", "HBA_CDP", "HBA_TRACE", "XDG_CONFIG_HOME"];
+const DAEMON_ENV: [&str; 8] = [
+    "HBA_CONFIG",
+    "HBA_BROWSER",
+    "HBA_USER_DATA_DIR",
+    "HBA_LAUNCHER",
+    "HBA_HUMANIZE",
+    "HBA_CDP",
+    "HBA_TRACE",
+    "XDG_CONFIG_HOME",
+];
 
 /// This process's values of [`DAEMON_ENV`], as one comparable string.
 pub fn daemon_env() -> String {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-/// Drive your running Helium browser: profiles, tabs, pages, DevTools and extensions.
+/// Drive your running Helium, Chrome or Brave: profiles, tabs, pages, DevTools and extensions.
 ///
 /// TARGET is a ref from `hba snap` (e5, f1e3) or a Playwright selector: css, text=Save,
 /// role=button[name="Save"], internal:label="Email", xpath=//a.
@@ -16,7 +16,7 @@ pub struct Cli {
     /// Task session (default: the project directory name)
     #[arg(short, long, global = true, env = "HBA_SESSION", value_parser = session_name, help_heading = GLOBAL)]
     pub session: Option<String>,
-    /// Helium profile for new tabs: display name, directory or alias
+    /// Browser profile for new tabs: display name, directory or alias
     #[arg(short, long, global = true, env = "HBA_PROFILE", help_heading = GLOBAL)]
     pub profile: Option<String>,
     /// Act on this session tab instead of the current one
@@ -106,7 +106,7 @@ pub enum Command {
     Tab(TabArgs),
     /// Resize, maximize, minimize or fullscreen the tab's window
     Window(WindowArgs),
-    /// List Helium profiles
+    /// List the browser's profiles
     Profiles,
     /// Session, tab and browser summary
     Status,
@@ -517,7 +517,7 @@ pub enum DialogAction {
 pub struct DownloadArgs {
     /// Element whose click starts the download
     pub target: String,
-    /// Destination file or directory (default: where Helium saved it)
+    /// Destination file or directory (default: where the browser saved it)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 }
@@ -1016,7 +1016,7 @@ pub enum ExtOp {
         #[arg(long)]
         clear: bool,
     },
-    /// Manifest and runtime errors reported by Helium
+    /// Manifest and runtime errors reported by the browser
     Errors {
         /// Extension id, unpacked directory, or (part of) its name
         ext: String,
@@ -1085,9 +1085,9 @@ pub struct BrowserArgs {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum BrowserOp {
-    /// Start Helium with a profile if it is not running
+    /// Start the browser with a profile if it is not running
     Launch,
-    /// Quit and relaunch Helium, restoring every open profile's tabs
+    /// Quit and relaunch the browser, restoring every open profile's tabs
     Restart,
     /// Print the verified DevTools WebSocket URL (for other CDP tools)
     Endpoint,

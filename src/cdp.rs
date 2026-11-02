@@ -90,16 +90,11 @@ struct Incoming<'a> {
 }
 
 impl Cdp {
-    /// Connects and returns the connection plus the stream of browser-level events.
+    /// Connects and returns the connection plus the stream of browser-level events. Unbounded:
+    /// a browser in approval mode answers only once its user allowed the connection.
     pub async fn connect(url: &str) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-        let (socket, _) = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio_tungstenite::connect_async_with_config(url, Some(config), true),
-        )
-        .await
-        .context("timed out connecting to Helium's DevTools endpoint")?
-        .context("connecting to Helium's DevTools endpoint")?;
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), true).await?;
         let (mut sink, mut stream) = socket.split();
         let (outgoing, mut queue) = mpsc::unbounded_channel::<String>();
         let (browser_tx, browser_rx) = mpsc::unbounded_channel();
@@ -169,7 +164,7 @@ impl Cdp {
     /// Writes a command to the socket and registers for its reply.
     fn post(&self, method: &str, params: impl Serialize, session: Option<&str>) -> Result<(Reply, Slot)> {
         if self.is_closed() {
-            bail!("the connection to Helium is closed");
+            bail!("the connection to the browser is closed");
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let text = serde_json::to_string(&Outgoing { id, method, session, params })?;
@@ -178,7 +173,7 @@ impl Cdp {
         // Removes the entry however the call ends, including when its future is dropped.
         let slot = Slot { inner: Arc::clone(&self.inner), id };
         if self.inner.outgoing.send(text).is_err() {
-            bail!("the connection to Helium is closed");
+            bail!("the connection to the browser is closed");
         }
         Ok((rx, slot))
     }
@@ -219,7 +214,7 @@ async fn answer(reply: Reply, slot: Slot, method: &str, timeout: Duration) -> Re
     match outcome {
         Ok(Ok(Ok(result))) => Ok(result),
         Ok(Ok(Err(error))) => Err(anyhow::Error::new(error).context(method.to_owned())),
-        Ok(Err(_)) => Err(anyhow!("{method}: the connection to Helium closed")),
+        Ok(Err(_)) => Err(anyhow!("{method}: the connection to the browser closed")),
         Err(_) => Err(anyhow!("{method} timed out after {}s", timeout.as_secs_f32())),
     }
 }

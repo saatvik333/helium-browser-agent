@@ -417,6 +417,23 @@ fn adopted_tabs_are_released_not_closed(rig: &Rig) {
     rig.ok(s, &["tab", "new", &rig.url("page2.html")]);
     assert!(rig.ok(s, &["get", "url"]).contains("page2.html"));
     assert!(rig.ok(s, &["-T", &user_tab, "get", "url"]).contains("index.html"));
+    // The handover is saved to disk, so a new daemon still knows the tab is the session's.
+    rig.ok(s, &["daemon", "stop"]);
+    assert!(rig.ok(s, &["-T", &user_tab, "get", "url"]).contains("index.html"));
+    // A release queues behind the session's running command, then takes the tab away.
+    let released = thread::scope(|scope| {
+        let waiting = scope.spawn(|| rig.ok(s, &["-T", &user_tab, "wait", "1500"]));
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let released = rig.ok(s, &["tab", "release", &user_tab]);
+        assert!(started.elapsed() > Duration::from_millis(800), "release did not wait: {released}");
+        waiting.join().expect("waiting command");
+        released
+    });
+    assert!(released.contains("released"), "{released}");
+    let refused = rig.fails(s, &["-T", &user_tab, "get", "url"]);
+    assert!(refused.contains("not in session"), "{refused}");
+    rig.ok(s, &["tab", "use", &user_tab]);
     let closed = rig.ok(s, &["close"]);
     assert!(closed.contains("closed 1 tab, released 1"), "{closed}");
     let left = rig.ok(s, &["tabs", "--all"]);

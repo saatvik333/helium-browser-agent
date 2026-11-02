@@ -88,6 +88,14 @@ project (git root) directory name. A session owns the tabs it opens and has a cu
 parallel agents distinct sessions. `hba close` closes the session's tabs and hands adopted tabs
 back.
 
+**Tab ownership.** A session can only act on its own tabs. Any other tab, including one it never
+opened and one it released, fails with "not in session" and exit status 1, never an empty
+result. One of your tabs becomes the session's only through `hba tab use t42`, and goes back with
+`hba tab release` or `hba close`; `hba tab close` closes it for good. Commands in a session run
+one at a time, so a release takes effect after the command already running on that tab returns.
+Ownership is saved to disk and survives a daemon restart; a browser restart ends it, because tab
+numbers start over.
+
 **Profiles.** New tabs open in the profile chosen by `-p`/`$HBA_PROFILE`, the session's earlier
 choice, a directory rule, the configured default, or Helium's last-used profile, in that order.
 

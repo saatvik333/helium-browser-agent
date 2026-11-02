@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Controls</title></head>
+<body>
+<h1>Controls</h1>
+<p id="log">ready</p>
+<script>function log(text) { document.getElementById('log').textContent = text; }</script>
+<button id="hover" onmouseenter="log('hovered')">Hover me</button>
+<button id="double" ondblclick="log('double clicked')">Double</button>
+<button id="context" oncontextmenu="event.preventDefault(); log('context menu')">Context</button>
+<button id="modifier" onclick="log(event.ctrlKey ? 'control click' : 'plain click')">Modifier</button>
+<button id="ask" onclick="log('hello ' + prompt('Name?', 'anon'))">Ask name</button>
+<button id="off" disabled>Unavailable</button>
+<button id="hidden" style="display: none">Hidden</button>
+<label>Plan <select id="plan" onchange="log('plan ' + this.value)">
+  <option value="free">Free</option><option value="pro">Pro</option><option value="team">Team</option>
+</select></label>
+<label><input type="checkbox" id="terms" onchange="log('terms ' + this.checked)"> Accept terms</label>
+<label><input type="radio" name="size" value="small"> Small</label>
+<label><input type="radio" name="size" value="large" onchange="log('size large')"> Large</label>
+<label>Fixed <input id="fixed" readonly value="fixed"></label>
+<label>Short <input id="short" maxlength="3"></label>
+<label>Keys <input id="keys" onkeydown="log('key ' + (event.ctrlKey ? 'Control+' : '') + event.key)"></label>
+<div id="box" role="region" aria-label="Scroll box" tabindex="0" style="height: 100px; overflow: auto; border: 1px solid">
+  <div style="height: 1000px">tall content</div>
+</div>
+<div style="height: 1500px"></div>
+<button id="far" onclick="log('far clicked')">Far button</button>
+</body>
+</html>

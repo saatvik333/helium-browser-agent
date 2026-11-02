@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Devtools network</title><link rel="stylesheet" href="/devtools-net.css"></head>
+<body>
+<h1>Network fixture</h1>
+<p id="out">loading</p>
+<button id="load" onclick="load()">Load data</button>
+<button id="post" onclick="post()">Post</button>
+<p id="posted"></p>
+<script>
+function load() {
+  fetch('/devtools-data.json?v=' + Date.now())
+    .then((response) => response.json())
+    .then((data) => { document.getElementById('out').textContent = data.message; })
+    .catch((error) => { document.getElementById('out').textContent = 'failed: ' + error.message; });
+}
+function post() {
+  fetch('/devtools-data.json', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({hello: 'world'})})
+    .then((response) => { document.getElementById('posted').textContent = 'posted ' + response.status; });
+}
+load();
+</script>
+</body>
+</html>

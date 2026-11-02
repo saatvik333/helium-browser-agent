@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Input edges</title></head>
+<body style="margin: 0">
+<p id="log">ready</p>
+<script>
+const keys = [];
+for (const type of ['keydown', 'keyup']) addEventListener(type, e => keys.push(`${type} ${e.key}`));
+function log(text) { document.getElementById('log').textContent = text; }
+</script>
+<div style="height: 300px"></div>
+<div id="tall" style="height: 3000px; background: #ddd"
+     onclick="log(`at ${Math.round(event.offsetX)},${Math.round(event.offsetY)}`)">Tall</div>
+</body>
+</html>

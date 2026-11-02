@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Leaving for a website</title></head>
+<body>
+<h1>Local page</h1>
+<p><a id="redirect">Through a redirect</a></p>
+<p><a id="no-content">To a website that answers 204</a></p>
+<button id="script">By script</button>
+<script>
+  // remote.example resolves to the fixture server but is not a local host to hba; /slow/ gives
+  // it a website's response time.
+  const website = `http://remote.example:${location.port}`;
+  const remote = `${website}/slow/console-remote.html`;
+  document.getElementById('redirect').href = `/redirect?to=${remote}`;
+  document.getElementById('no-content').href = `${website}/no-content`;
+  document.getElementById('script').onclick = () => { location.href = remote; };
+  console.log('local page log');
+</script>
+</body>
+</html>

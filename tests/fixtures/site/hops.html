@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Hops</title></head>
+<body>
+<p id="state">hopping</p>
+<script>
+// `?left=N` replaces itself N more times, then says it arrived.
+const left = Number(new URLSearchParams(location.search).get('left'));
+if (left > 0) setTimeout(() => location.replace(`?left=${left - 1}`), 20);
+else document.getElementById('state').textContent = 'Arrived';
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Back and forward</title></head>
+<body>
+<h1>Local page for history</h1>
+<script>
+  console.log('history page log');
+  // `persisted` is true when the page comes back from the back/forward cache.
+  addEventListener('pageshow', (event) => { if (event.persisted) console.log('history page restored'); });
+</script>
+</body>
+</html>

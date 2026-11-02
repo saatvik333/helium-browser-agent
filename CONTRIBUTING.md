@@ -1,30 +1,24 @@
 # Contributing
 
-Start with the README and [architecture](docs/architecture.md). Create a focused
-branch and describe the concrete failure or behavior you want to change. Include
-reproduction steps, dependency versions and relevant validation in your change.
+Start with the README and [architecture](docs/architecture.md). Describe the concrete failure or
+behavior you want to change, with the Helium version (`hba doctor`) and the commands that show it.
 
 ```sh
-uv sync --locked
-uv run python -m unittest discover -s tests -v
-uv run ruff check .
-uv build
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
+HBA_LIVE=1 cargo test --test live    # starts its own headless Helium; never touches yours
 ```
 
-Add regression tests for meaningful ownership, cleanup, configuration, protocol
-or input fixes. Use fake CDP transports for deterministic failures. Run the live
-fixtures only with an explicitly authorized profile; preserve user tabs, browser
-settings and dialogs. Full-browser restarts are not a normal test step.
+- Fix a bug with a test that fails without the fix: a unit test for pure logic, `tests/cli.rs` for
+  daemon and configuration behavior, `tests/live.rs` with a page in `tests/fixtures/site/` for
+  anything that needs a browser.
+- Keep websites unable to tell `hba` is there: no `Runtime.enable` or `Log.enable` on websites, no
+  code in the page's own world, real input. A change that needs more says why in the code.
+- Output is read by models: one line per fact, no decoration, and errors that name the next
+  command to run.
+- Update `assets/playwright` only with `bun scripts/vendor-playwright.mjs`, as its own change, and
+  run the live suite with it.
+- Never share logs, HAR files or screenshots from a real profile; use a fixture page.
 
-Use the pinned dependency versions. Dependency upgrades should be separate
-changes with live coverage of snapshot references, native fill, dialogs, relay
-recovery, sockets and cleanup. Never weaken ownership checks to make a test pass.
-
-Before sharing a patch or log, remove cookies, tokens, profile files, endpoint
-URLs, page contents and account details. Use a synthetic fixture instead of a
-private website. Keep runtime files under the cache or ignored `artifacts/`.
-Report a security issue privately to the repository maintainer when a private
-channel is available; avoid posting credentials or sensitive reproductions.
-
-Contributions are under the project's Apache-2.0 license. Preserve upstream
-notices and explain any copied compatibility code in NOTICE.
+Contributions are under the project's Apache-2.0 license.

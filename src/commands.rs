@@ -1,0 +1,62 @@
+//! Routes each command to its handler.
+
+use anyhow::Result;
+
+use crate::cli::Command;
+use crate::daemon::Cx;
+
+pub async fn run(cx: &mut Cx<'_>, command: Command) -> Result<()> {
+    match command {
+        Command::Open(args) => crate::nav::open(cx, args).await,
+        Command::Back => crate::nav::history(cx, -1).await,
+        Command::Forward => crate::nav::history(cx, 1).await,
+        Command::Reload(args) => crate::nav::reload(cx, args).await,
+        Command::Snap(args) => crate::inspect::snap(cx, args).await,
+        Command::Find(args) => crate::inspect::find(cx, args).await,
+        Command::Text(args) => crate::inspect::text(cx, args).await,
+        Command::Get(args) => crate::inspect::get(cx, args).await,
+        Command::Is(args) => crate::inspect::is(cx, args).await,
+        Command::Shot(args) => crate::media::shot(cx, args).await,
+        Command::Pdf(args) => crate::media::pdf(cx, args).await,
+        Command::Click(args) => crate::actions::click(cx, args).await,
+        Command::Hover(args) => crate::actions::hover(cx, args).await,
+        Command::Focus(args) => crate::actions::focus(cx, args).await,
+        Command::Fill(args) => crate::actions::fill(cx, args).await,
+        Command::Type(args) => crate::actions::type_text(cx, args).await,
+        Command::Press(args) => crate::actions::press(cx, args).await,
+        Command::Check(args) => crate::actions::set_checked(cx, args, true).await,
+        Command::Uncheck(args) => crate::actions::set_checked(cx, args, false).await,
+        Command::Select(args) => crate::actions::select(cx, args).await,
+        Command::Upload(args) => crate::transfer::upload(cx, args).await,
+        Command::Drag(args) => crate::transfer::drag(cx, args).await,
+        Command::Scroll(args) => crate::actions::scroll(cx, args).await,
+        Command::Mouse(args) => crate::actions::mouse(cx, args).await,
+        Command::Wait(args) => crate::actions::wait(cx, args).await,
+        Command::Dialog(args) => crate::actions::dialog(cx, args).await,
+        Command::Download(args) => crate::download::command(cx, args).await,
+        Command::Js(args) => crate::script::js(cx, args).await,
+        Command::Cdp(args) => crate::script::cdp(cx, args).await,
+        Command::Run(args) => crate::script::run(cx, args).await,
+        Command::Tabs(args) => crate::tabs::list(cx, args).await,
+        Command::Tab(args) => crate::tabs::tab(cx, args.op).await,
+        Command::Window(args) => crate::tabs::window(cx, args).await,
+        Command::Profiles => crate::tabs::profiles(cx).await,
+        Command::Status => crate::tabs::status(cx).await,
+        Command::Close(args) => crate::tabs::close(cx, args).await,
+        Command::Console(args) => crate::devtools::console(cx, args).await,
+        Command::Errors(args) => crate::devtools::errors(cx, args).await,
+        Command::Net(args) => crate::devtools::net(cx, args).await,
+        Command::Perf(args) => crate::devtools::perf(cx, args.op).await,
+        Command::Devtools(args) => crate::devtools::open_devtools(cx, args).await,
+        Command::Emulate(args) => crate::emulate::emulate(cx, args).await,
+        Command::Cookies(args) => crate::storage::cookies(cx, args).await,
+        Command::Storage(args) => crate::storage::storage(cx, args).await,
+        Command::State(args) => crate::storage::state(cx, args).await,
+        Command::Perms(args) => crate::storage::perms(cx, args.op).await,
+        Command::Ext(args) => crate::extensions::ext(cx, args.op).await,
+        Command::Clip(args) => crate::clip::clip(cx, args).await,
+        Command::Browser(args) => crate::system::browser(cx, args.op).await,
+        Command::Daemon(args) => crate::system::daemon(cx, args.op).await,
+        Command::Doctor => crate::system::doctor(cx).await,
+    }
+}

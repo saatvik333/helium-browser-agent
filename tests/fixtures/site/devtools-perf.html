@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><title>Devtools perf</title>
+<link rel="stylesheet" href="/devtools-perf.css">
+<script src="/devtools-perf.js"></script>
+</head>
+<body>
+<h1 id="hero">Performance fixture</h1>
+<p id="result">idle</p>
+<button id="work" onclick="busy()">Work</button>
+<p class="card">Cards render here.</p>
+<script>
+// Pushes the content down after the first paint: a layout shift without user input.
+setTimeout(() => {
+  const banner = document.createElement('div');
+  banner.className = 'banner';
+  banner.textContent = 'late banner';
+  document.body.prepend(banner);
+}, 300);
+</script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media: drag and drop</title>
+<style>
+  body { font: 16px/1.4 sans-serif; margin: 24px; }
+  .box { width: 140px; height: 70px; border: 2px solid #335; display: inline-flex; align-items: center; justify-content: center; margin: 8px; }
+  #zone, #bin { width: 220px; height: 110px; border-style: dashed; margin-left: 160px; }
+  #handle { position: relative; cursor: grab; background: #fde; user-select: none; }
+</style>
+</head>
+<body>
+<h1>Drag fixture</h1>
+<p id="status">idle</p>
+
+<section aria-label="HTML5">
+  <div id="item" class="box" draggable="true">HTML5 item</div>
+  <div id="zone" class="box">Drop zone</div>
+</section>
+
+<section aria-label="Mouse">
+  <div id="handle" class="box">Mouse handle</div>
+  <div id="bin" class="box">Bin</div>
+</section>
+
+<script>
+  const status = document.getElementById('status');
+  const item = document.getElementById('item');
+  const zone = document.getElementById('zone');
+  item.addEventListener('dragstart', event => {
+    event.dataTransfer.setData('text/plain', 'payload-42');
+    event.dataTransfer.effectAllowed = 'move';
+  });
+  zone.addEventListener('dragover', event => event.preventDefault());
+  zone.addEventListener('drop', event => {
+    event.preventDefault();
+    status.textContent = 'html5 dropped ' + event.dataTransfer.getData('text/plain');
+    zone.textContent = 'Got it';
+  });
+  item.addEventListener('dragend', event => {
+    status.textContent += ' (dragend ' + event.dataTransfer.dropEffect + ')';
+  });
+
+  // A pointer-driven drag like sortable and dnd libraries: no HTML5 drag events at all.
+  const handle = document.getElementById('handle');
+  const bin = document.getElementById('bin');
+  let start = null;
+  let moves = 0;
+  handle.addEventListener('mousedown', event => {
+    event.preventDefault();
+    start = { x: event.clientX, y: event.clientY };
+    moves = 0;
+  });
+  document.addEventListener('mousemove', event => {
+    if (!start || !(event.buttons & 1)) return;
+    moves++;
+    handle.style.left = (event.clientX - start.x) + 'px';
+    handle.style.top = (event.clientY - start.y) + 'px';
+  });
+  document.addEventListener('mouseup', event => {
+    if (!start) return;
+    const r = bin.getBoundingClientRect();
+    const inside = event.clientX >= r.left && event.clientX <= r.right && event.clientY >= r.top && event.clientY <= r.bottom;
+    status.textContent = inside ? 'mouse dropped after ' + moves + ' moves' : 'mouse released outside';
+    start = null;
+  });
+</script>
+</body>
+</html>

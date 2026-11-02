@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Routes: cross-origin calls</title>
+</head>
+<body>
+  <p id="log">idle</p>
+  <script>
+    // A JSON POST with a custom header: cross-origin, it needs a CORS preflight.
+    async function callApi(url) {
+      const log = document.getElementById('log');
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'X-Fixture': 'yes'},
+          body: JSON.stringify({n: 1}),
+        });
+        log.textContent = `${response.status} ${await response.text()}`;
+      } catch (error) {
+        log.textContent = `failed: ${error.message}`;
+      }
+      return log.textContent;
+    }
+  </script>
+</body>
+</html>

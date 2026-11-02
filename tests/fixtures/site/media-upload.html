@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media: uploads</title>
+</head>
+<body>
+<h1>Upload fixture</h1>
+<p id="status">idle</p>
+<label>Attachments <input id="file" type="file" multiple></label>
+<p>
+  <button id="pick" onclick="document.getElementById('hidden').click()">Choose a photo</button>
+  <input id="hidden" type="file" hidden>
+</p>
+<script>
+  const status = document.getElementById('status');
+  for (const input of document.querySelectorAll('input[type=file]')) {
+    input.addEventListener('change', () => {
+      status.textContent = input.id + ': ' + [...input.files].map(f => f.name + ' ' + f.size).join(', ');
+    });
+  }
+</script>
+</body>
+</html>

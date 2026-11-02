@@ -1,0 +1,2 @@
+# Product and web-platform names that read as words in docs and help text.
+doc-valid-idents = ["DevTools", "DOMContentLoaded", ".."]

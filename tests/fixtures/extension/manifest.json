@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "hba test extension",
+  "version": "1.0.0",
+  "description": "Fixture for hba ext: service worker logs and errors, popup, options, content script, storage.",
+  "background": { "service_worker": "sw.js" },
+  "action": { "default_title": "hba test", "default_popup": "popup.html" },
+  "options_page": "options.html",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["http://127.0.0.1:8765/ext-*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

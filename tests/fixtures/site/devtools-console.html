@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Devtools console</title></head>
+<body>
+<h1>Console fixture</h1>
+<button id="log" onclick="logAll()">Log</button>
+<button id="throw" onclick="setTimeout(() => { throw new Error('kaboom from fixture'); })">Throw</button>
+<button id="reject" onclick="Promise.reject(new TypeError('rejected in fixture'))">Reject</button>
+<button id="fail" onclick="fetch('/devtools-missing.json'); fetch('http://127.0.0.1:9/unreachable').catch(() => {})">Fail requests</button>
+<script>
+function logAll() {
+  console.debug('debug detail');
+  console.log('plain log', 42, {a: 1, b: [1, 2]});
+  console.info('info message');
+  console.warn('first line\nsecond line');
+  console.error('boom from devtools fixture');
+}
+console.log('loaded devtools console fixture');
+</script>
+</body>
+</html>

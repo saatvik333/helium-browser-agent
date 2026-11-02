@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media: downloads</title>
+</head>
+<body>
+<h1>Download fixture</h1>
+<p><a id="file" href="/media-download.txt" download="media-report.txt">Download report</a></p>
+<p><button id="blob" onclick="
+  const a = document.createElement('a');
+  a.href = window.URL.createObjectURL(new Blob(['generated in the page\n'], {type: 'text/plain'}));
+  a.download = 'media-generated.txt';
+  a.click();">Export generated file</button></p>
+<p><button id="nothing">Does nothing</button></p>
+</body>
+</html>

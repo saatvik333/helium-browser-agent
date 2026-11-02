@@ -1,170 +1,125 @@
-# Helium Browser Agent
+# hba
 
-Control a running Helium browser on Linux through named, task-owned sessions.
-Choose an existing browser profile, automate your own tabs, and clean them up
-without borrowing unrelated tabs. Two interfaces share the same profile and
-ownership layer: Python helpers through `helium-browser-use`, and the native
-`agent-browser` CLI through `agent-browser-helium`.
+`hba` drives your running [Helium](https://helium.computer/) browser from the shell: your own
+profiles and logins, tabs, pages, DevTools and extension development. It is built for coding agents
+(one short command per step, compact output, errors that say what to do next) and works just as
+well by hand.
 
-This is an early standalone release extracted from a working local integration.
-It includes literal text insertion, popup cleanup, reconnect recovery, bounded
-session locks, and telemetry opt-outs. It does not include an LLM or require an
-AI API key; an agent or your own scripts decide which actions to run.
+```sh
+hba open github.com/notifications     # the session's own background tab in your profile; prints `t5 url "title"`
+hba snap -i                           # interactive elements with refs: - link "Inbox" [ref=e12]
+hba click e12                         # real mouse input; prints what changed (→ url, + popup, ! dialog, errors)
+hba fill 'internal:label="Search"i' 'is:open' --submit
+hba close                             # closes this session's tabs
+```
+
+- **Your browser, not a copy.** `hba` attaches to the Helium you already run, over a loopback
+  DevTools port whose owner it verifies. Agents get their own background tabs; your tabs are
+  untouched unless you hand one over (`hba tab use t42`).
+- **Fast.** A small daemon keeps one DevTools connection open, so commands take milliseconds and
+  the browser never restarts.
+- **Hard to detect.** Page work runs in an isolated world that pages cannot see, input is trusted
+  mouse and keyboard events with human timing on websites, and the `Runtime` and `Log` domains that
+  anti-bot scripts probe for stay off on websites unless you ask.
+- **Full DevTools.** Console, exceptions, network log with bodies, blocking and mocking, HAR,
+  performance traces, CPU profiles, heap snapshots, coverage, web vitals, emulation, cookies and
+  storage.
+- **Extension development.** Load, reload and remove unpacked extensions, read their service-worker
+  and page consoles, errors and storage, evaluate in the service worker or a content script, and
+  drive the popup like a page.
+
+The page engine is [Playwright](https://playwright.dev/)'s injected script (accessibility snapshot,
+selectors, actionability checks), vendored and pinned.
 
 ## Requirements
 
-- Linux with `/proc`, Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
-- [Helium](https://helium.com/) installed and configured for **loopback-only CDP**.
-  Live tests ran against Chromium 154.0.8037.92. The installed update is Helium
-  0.19.2.1 / Chromium 155.0.8059.39; it awaits a browser restart and retest.
-- An existing Helium profile whose display name you know.
-- For the native CLI adapter only: `agent-browser` **0.37.0** on PATH.
-  The adapter depends on that version's fill, socket and target-binding behavior.
+- Linux (endpoint verification reads `/proc`).
+- Helium on Chromium 150 or newer, with remote debugging on a loopback port. Add the flag to
+  `~/.config/helium-browser-flags.conf` and restart Helium:
 
-The Python dependencies are locked, including browser-harness 0.1.13 and
-websockets 15.0.1. The larger browser-use/LLM SDK stack is not required.
-Windows, macOS, remote browsers and multiple simultaneous Helium main processes
-are outside the supported scope. Niri focus restoration is optional.
+  ```
+  --remote-debugging-port=9222
+  ```
+
+  DevTools access is full control of the browser; keep it on loopback. `hba` refuses a port that
+  listens beyond loopback or belongs to another process.
+- Rust 1.89 or newer to build.
 
 ## Install
 
-From this checkout:
+Paste this into your coding agent (Claude Code, Codex, omp, …):
+
+```
+Fetch and follow the instructions at https://raw.githubusercontent.com/saatvik333/helium-browser-agent/main/AGENT-SETUP.md to set up hba for me.
+```
+
+It installs `hba`, turns on Helium's DevTools port (asking before restarting Helium), links the
+skill for your agents and checks everything works. Run it again to update.
+
+By hand:
 
 ```sh
-uv sync --locked
-uv run helium-agent --version
-uv run helium-agent profiles
-uv run helium-agent doctor
+cargo install --path . --locked     # installs ~/.cargo/bin/hba
+hba doctor                          # endpoint, profiles and daemon checks
+ln -s "$PWD/skill" ~/.agents/skills/hba
 ```
 
-`doctor` reads endpoint ownership and versions; it does not launch Helium, open
-tabs or restart it. `profiles` reads only profile display-name/directory metadata.
-Its `running_browser` field reports the active process. `helium-browser --version`
-reports the installed binary, which can differ until the browser is restarted.
-Use `uv run` while developing to avoid replacing existing global commands.
-To install the Python CLIs for general use:
+## Commands
+
+`hba --help` and `hba COMMAND --help` describe every option. A TARGET is a ref from the latest
+`snap` (`e5`, or `f1e3` inside a frame) or a Playwright selector (`'#id'`, `'text=Save'`,
+`'role=button[name="Save"]'`, `'internal:label="Email"i'`).
+
+| Area | Commands |
+| --- | --- |
+| Navigate | `open`, `back`, `forward`, `reload` |
+| Read | `snap` (`-i` interactive, `-v` viewport, `-d` diff, `-S` subtree), `find`, `text`, `get`, `is` |
+| Act | `click`, `hover`, `focus`, `fill`, `type`, `press`, `check`, `uncheck`, `select`, `upload`, `drag`, `scroll`, `mouse`, `wait`, `dialog`, `download` |
+| Capture | `shot` (`-a` labels refs), `pdf` |
+| Tabs and sessions | `tabs`, `tab new/use/close/release/front`, `window`, `profiles`, `status`, `close` |
+| DevTools | `console`, `errors`, `net` (`show`, `body`, `block`, `mock`, `unroute`, `har`), `perf` (`metrics`, `vitals`, `trace`, `profile`, `heap`, `coverage`), `devtools` |
+| Environment | `emulate`, `cookies`, `storage`, `state`, `perms`, `clip` |
+| Extensions | `ext` (`load`, `reload`, `rm`, `eval`, `logs`, `errors`, `popup`, `open`, `storage`, `sw`), `js --world EXT` |
+| Escape hatches | `js`, `cdp`, `run` (many commands in one call) |
+| Browser and daemon | `browser launch/restart/endpoint`, `daemon status/stop`, `doctor` |
+
+**Sessions.** Every command belongs to a session: `-s NAME`, `$HBA_SESSION`, or by default the
+project (git root) directory name. A session owns the tabs it opens and has a current tab; give
+parallel agents distinct sessions. `hba close` closes the session's tabs and hands adopted tabs
+back.
+
+**Profiles.** New tabs open in the profile chosen by `-p`/`$HBA_PROFILE`, the session's earlier
+choice, a directory rule, the configured default, or Helium's last-used profile, in that order.
+
+**Output.** Text is compact and meant to be read by a model; `--json` gives structured output for
+`tabs`, `status`, `open`, `tab`, `js`, `profiles` and others. Exit status 1 means the command failed
+(its message says why and usually what to run next); 2 means the command line was wrong.
+
+## Configuration
+
+Everything works without a config file. Profile aliases, directory rules, the browser location and
+input timing are set in `~/.config/hba/config.toml` or `HBA_*` variables, checked when a command
+first needs them; see [configuration](docs/configuration.md).
+
+## How it works
+
+See [architecture](docs/architecture.md): the daemon, how tabs are attached, the page engine,
+actionability and settling, dialogs, stealth rules, and extension debugging.
+
+## Development
 
 ```sh
-uv tool install .
+cargo build
+cargo clippy --all-targets -- -D warnings
+cargo test                                   # unit and CLI tests
+HBA_LIVE=1 cargo test --test live            # end to end against a throwaway headless Helium
+bun scripts/vendor-playwright.mjs            # refresh assets/playwright from the pinned version
 ```
 
-An existing command with the same name may prevent installation. Back up your
-existing integration and close its task sessions before deliberately replacing
-it. The new project uses a separate `helium-browser-agent` cache and `hba-`
-harness daemon prefix; it does not adopt the old Python wrapper's sessions.
-`uv tool uninstall helium-browser-agent` removes the installed tool, leaving
-browser profiles and task state alone. Close sessions before uninstalling.
+The live tests start their own headless Helium with a temporary profile and never touch your
+browser. `HBA_TRACE=1` adds per-command timings to `$XDG_RUNTIME_DIR/hba/daemon.log`.
 
-For the optional native adapter, install the compatible upstream CLI separately:
+## License
 
-```sh
-npm install --global agent-browser@0.37.0
-```
-
-Its browser-download command is unnecessary when attaching to your existing
-Helium. See [the adapter guide](docs/agent-browser.md) for supported commands.
-
-## Configure Helium and profiles
-
-Helium must already expose a local CDP endpoint. This project discovers it from
-`$XDG_CONFIG_HOME/helium-browser-flags.conf` (`--remote-debugging-port=PORT`) or
-the profile root's `DevToolsActivePort` file, then verifies that the listener
-belongs to the running Helium main process. Packaging and browser policy can
-affect whether remote debugging of the chosen data directory is available.
-The installer does not edit browser flags or restart your browser.
-
-CDP grants extensive access to a browser. Keep the listener on loopback, never
-expose it to a network, and run only trusted automation. A named task shares its
-profile's cookies and storage; it is not a security boundary between accounts.
-
-```sh
-mkdir -p ~/.config/helium-browser-agent
-cp examples/config.toml ~/.config/helium-browser-agent/config.toml
-```
-
-Edit the profile names to match `helium-agent profiles`. The default name is
-`Personal`; `--profile 'Your exact name'` overrides it. `--personal` and `--work`
-use configurable aliases. There are no built-in company or workspace mappings.
-See [configuration](docs/configuration.md) for paths, environment overrides and
-optional workspace rules.
-
-## Python helper interface
-
-Use a fresh session name for a task, then reuse it across invocations. The wrapper
-creates and attaches an owned working tab before your code runs.
-
-```sh
-uv run helium-browser-use --session example --profile Personal <<'PY'
-goto_url('https://example.com')
-assert wait_for_load()
-print(js('document.title'))
-PY
-
-uv run helium-browser-use --session example --close
-```
-
-For a form you own:
-
-```python
-assert wait_for_element('#message')
-fill_input('#message', 'First line\nSecond line\twith a tab')
-assert input_value('#message') == 'First line\nSecond line\twith a tab'
-```
-
-`fill_input` uses native bulk insertion and verifies the exact result. It refuses
-readonly, disabled and unsupported elements. It preserves textareas/editor
-newlines, tabs and Unicode, normalizing CRLF/CR to LF. Application-specific masks,
-editors and asynchronous state changes still need assertions on the application.
-
-`list_tabs()` lists task-owned pages. `new_tab`, `switch_tab`, `activate_tab` and
-`close_tab` enforce ownership. Background operation is the default; profile
-identification can briefly activate a newly launched probe. `list_tabs(all_tabs=True)`
-is an explicit read-only wider inventory. Raw Python/CDP remains powerful.
-
-## Native CLI interface
-
-```sh
-uv run agent-browser-helium --session example --profile Personal open https://example.com
-uv run agent-browser-helium --session example snapshot -i
-uv run agent-browser-helium --session example get title
-uv run agent-browser-helium --session example close
-```
-
-Profile and session options go before the command. `close` removes owned tabs;
-`detach` stops the task backend while retaining tabs. The relay filters target
-discovery and attachment before the backend sees pages, preserving other tasks'
-tabs and dialogs. Broader browser/cloud/setup commands are deliberately excluded.
-
-## Develop and test
-
-```sh
-uv sync --locked
-uv run python -m unittest discover -s tests -v
-uv run ruff check .
-uv build
-```
-
-Offline tests use fake transports and temporary state. The live suites create
-local HTTP fixtures and owned tabs in the **Personal alias**, then clean up.
-They require a running, verified Helium endpoint and the optional native CLI:
-
-```sh
-uv run python tests/live/live_checks.py
-uv run python tests/live/live_agent.py
-```
-
-Do not run live tests against a profile whose use has not been authorized.
-They are opt-in and excluded from CI. Results go to ignored `artifacts/`.
-See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/architecture.md),
-and [validation and limits](docs/validation.md).
-
-## Privacy and license
-
-Both wrappers force browser-tool telemetry/cloud-sync opt-outs and disable
-automatic recording or saved-session replay in their task environment.
-Installation does not change global shell settings or other tools' preferences.
-Browser-vendor traffic and explicit user-requested screenshots/traces are separate.
-No profiles, cookies, credentials, browsing history or live task state are shipped.
-
-Project code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE) for the
-small upstream compatibility snippet and dependency attribution.
+Apache-2.0. `assets/playwright` holds files from Playwright (Apache-2.0, Microsoft); see
+[NOTICE](NOTICE).

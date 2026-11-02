@@ -1,0 +1,8 @@
+body { font-family: sans-serif; margin: 2rem; }
+#hero { font-size: 3rem; }
+.banner { height: 120px; background: #eee; }
+.card { padding: 1rem; border: 1px solid #ccc; }
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); }
+.modal .dialog { margin: 10vh auto; max-width: 40rem; background: white; padding: 2rem; }
+.tooltip { position: absolute; padding: 0.25rem 0.5rem; background: black; color: white; }
+.sidebar { width: 16rem; border-right: 1px solid #ccc; }

@@ -9,7 +9,7 @@
   "permissions": ["storage"],
   "content_scripts": [
     {
-      "matches": ["http://127.0.0.1:8765/ext-*"],
+      "matches": ["*://*/ext-*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

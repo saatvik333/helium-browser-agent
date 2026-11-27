@@ -6,7 +6,8 @@
 
 - **Client.** Each command is a short-lived process. It parses the arguments, reads stdin for `-`
   arguments and `run` scripts, sends one JSON request line over `$XDG_RUNTIME_DIR/hba/hba.sock`, and
-  prints the one JSON reply line. It starts the daemon when no socket answers.
+  prints the one JSON reply line. It starts the daemon when no socket answers. `--timeout` bounds how long a command waits for a busy
+  session and for a browser it launches.
 - **Daemon.** A background `hba` with one DevTools WebSocket to the browser. It keeps sessions,
   attached tabs, their isolated worlds and event buffers (console, network, downloads) warm, so a
   command costs milliseconds instead of a browser connection. Commands of one session run in
@@ -15,7 +16,9 @@
   is switched off again; `drag`, `browser restart` and the commands that stop a recording and save
   it run to completion. The daemon exits after `idle_minutes` (in approval mode not while it holds
   a connection or a request awaiting Allow), on `hba daemon stop`, or when a client of a different
-  build or `HBA_*` environment connects. On the way out it stops accepting connections and
+  build or environment (`HBA_*`, `XDG_CONFIG_HOME`, `HOME`) connects; clients queued behind it are
+  told to retry. `daemon status` and `daemon stop` are answered by any daemon of the same build
+  whatever its environment and never start one. On the way out it stops accepting connections and
   finishes the commands in flight, and in approval mode waits for the answer to an unanswered
   request (up to a minute in all); a new daemon takes over as soon as the old one releases its
   lock.
@@ -184,9 +187,10 @@ a quick viewport capture and fails within about 4 s if the browser does not draw
   the default (last-used) profile until the browser restarts. Since Chromium 149 it works over the
   WebSocket without `--remote-debugging-pipe` or `--enable-unsafe-extension-debugging` (verified
   on Helium 156 and Chrome 156); a browser that refuses it gets an error naming that requirement.
-- `ext eval`, `ext logs` and `ext sw` attach to the extension's service worker, background page or
-  extension pages. An attached debugger keeps a service worker running, as DevTools does; captured
-  logs continue across worker restarts and reloads.
+- `ext logs` attaches to the extension's service worker, background page and extension pages and
+  stays attached; `ext eval` and `ext storage` attach for that one command unless capture is
+  running; `ext sw` does not attach. An attached debugger keeps a service worker running, as
+  DevTools does; captured logs continue across worker restarts and reloads.
 - `ext errors` and `ext reload` use the browser's extension manager API from a hidden
   `chrome://extensions` page. Chromium records runtime errors only in developer mode, which
   `ext errors` turns on when needed and says so.

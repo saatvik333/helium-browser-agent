@@ -1,0 +1,6 @@
+# The toolchain CI and contributors build with; bump it on purpose, not with each release, because
+# pedantic clippy under `-D warnings` turns new lints into failures. `rust-version` in Cargo.toml
+# is the oldest compiler that must keep building, checked by its own CI job.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]

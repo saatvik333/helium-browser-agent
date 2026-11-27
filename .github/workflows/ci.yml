@@ -2,16 +2,57 @@ name: Rust checks
 on: [push, pull_request]
 permissions:
   contents: read
+env:
+  CARGO_TERM_COLOR: always
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # The toolchain in rust-toolchain.toml; bump both together.
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # The live suite needs Helium and runs only with HBA_LIVE=1.
+      # The live suite is ignored here and runs in the `live` job.
       - run: cargo test --locked
+
+  # `rust-version` in Cargo.toml is a promise: the oldest compiler must keep building the crate.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # `+1.89.0` overrides rust-toolchain.toml.
+      - run: cargo +1.89.0 check --locked --all-targets
+
+  # End to end against the runner's Chrome, headless, in a throwaway profile (never a real one).
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox uses.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: google-chrome --version
+      - run: HBA_HELIUM="$(which google-chrome)" cargo test --locked --test live -- --ignored
+        env:
+          HBA_BROWSER: chrome
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
+        with:
+          command: check advisories

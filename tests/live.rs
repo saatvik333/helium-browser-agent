@@ -1,9 +1,9 @@
 //! End-to-end tests against a throwaway headless browser. They never touch the user's browser.
 //!
-//! Run with `HBA_LIVE=1 cargo test --test live`. `HBA_HELIUM` overrides the browser binary
+//! Run with `cargo test --test live -- --ignored`. `HBA_HELIUM` overrides the browser binary
 //! (default `/opt/helium-browser-bin/helium`); for another browser set `HBA_BROWSER` too, e.g.
-//! `HBA_BROWSER=chrome HBA_HELIUM=/opt/google/chrome/chrome`. Without `HBA_LIVE` the suite is
-//! skipped.
+//! `HBA_BROWSER=chrome HBA_HELIUM=/opt/google/chrome/chrome`. The test is ignored by default, so
+//! a plain `cargo test` reports it as ignored instead of passing without a browser.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -58,19 +58,24 @@ impl Rig {
             assert!(Instant::now() < deadline, "the browser did not open a DevTools port");
             thread::sleep(Duration::from_millis(50));
         }
-        // While a fresh profile's bundled uBlock Origin starts, it holds the requests it sees and
-        // then reloads their tabs, swallowing a navigation. Wait until a link navigation sticks.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let _ = rig.raw("warmup", &["open", &rig.url("index.html")]);
-            let clicked = rig.raw("warmup", &["click", "text=Second page"]);
-            if String::from_utf8_lossy(&clicked.stdout).contains("page2.html") {
-                break;
-            }
-            assert!(Instant::now() < deadline, "navigations kept failing in the fresh profile");
-        }
-        rig.ok("warmup", &["close"]);
+        rig.settle();
         rig
+    }
+
+    /// Waits until two fresh tabs in a row open and follow a link. While a fresh profile's
+    /// bundled uBlock Origin starts, or after developer mode reloads it, it holds the requests
+    /// it sees and then reloads their tabs, swallowing navigations.
+    fn settle(&self) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut settled = 0;
+        while settled < 2 {
+            assert!(Instant::now() < deadline, "navigations kept failing in the fresh profile");
+            let opened = self.raw("warmup", &["--timeout", "5", "open", &self.url("index.html")]);
+            let clicked = self.raw("warmup", &["--timeout", "5", "click", "text=Second page"]);
+            self.raw("warmup", &["close"]);
+            let moved = String::from_utf8_lossy(&clicked.stdout).contains("page2.html");
+            settled = if opened.status.success() && moved { settled + 1 } else { 0 };
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -78,23 +83,51 @@ impl Rig {
     }
 
     fn raw(&self, session: &str, args: &[&str]) -> Output {
+        self.raw_with(session, args, &[])
+    }
+
+    /// Like `raw`, with more variables for the daemon (a daemon with other variables is replaced).
+    fn raw_with(&self, session: &str, args: &[&str], vars: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hba"))
             .args(["-s", session])
             .args(args)
             .env("HBA_USER_DATA_DIR", self.root.join("profile"))
             .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
+            // If the rig's browser is gone, hba must fail instead of starting the user's browser.
+            .env("HBA_LAUNCHER", self.root.join("launcher-must-not-run"))
+            // The daemon log carries the commands' progress, which tests wait for.
+            .env("HBA_TRACE", "1")
+            .env_remove("HBA_CONFIG")
+            .env_remove("HBA_HUMANIZE")
             .env_remove("HBA_SESSION")
             .env_remove("HBA_PROFILE")
             .env_remove("HBA_CDP")
+            .envs(vars.iter().copied())
             .stdin(Stdio::null())
             .output()
             .expect("run hba")
     }
 
+    /// Waits until the daemon log has a line containing every one of `parts`.
+    fn wait_for_log(&self, parts: &[&str]) {
+        let log = self.root.join("runtime/hba/daemon.log");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&log)
+            .is_ok_and(|log| log.lines().any(|line| parts.iter().all(|part| line.contains(part))))
+        {
+            assert!(Instant::now() < deadline, "no log line with {parts:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Runs hba and returns stdout, failing with stderr when the command fails.
     fn ok(&self, session: &str, args: &[&str]) -> String {
-        let output = self.raw(session, args);
+        self.ok_with(session, args, &[])
+    }
+
+    fn ok_with(&self, session: &str, args: &[&str], vars: &[(&str, &str)]) -> String {
+        let output = self.raw_with(session, args, vars);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(output.status.success(), "hba {args:?} failed: {}{stdout}", String::from_utf8_lossy(&output.stderr));
         stdout
@@ -114,8 +147,8 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        if thread::panicking() || env::var_os("HBA_TRACE").is_some() {
-            // The daemon log (per-command timings with HBA_TRACE=1) explains most failures.
+        if thread::panicking() {
+            // The daemon log (per-command timings) explains most failures.
             let log = fs::read_to_string(self.root.join("runtime/hba/daemon.log")).unwrap_or_default();
             eprintln!("--- daemon.log ---\n{log}");
         }
@@ -207,11 +240,8 @@ fn ref_of(snapshot: &str, needle: &str) -> String {
 }
 
 #[test]
+#[ignore = "needs a browser: cargo test --test live -- --ignored"]
 fn live() {
-    if env::var_os("HBA_LIVE").is_none() {
-        eprintln!("live tests skipped; run with HBA_LIVE=1");
-        return;
-    }
     let rig = Rig::start();
     open_snapshot_click_and_navigate(&rig);
     fill_type_and_submit(&rig);
@@ -219,11 +249,20 @@ fn live() {
     covered_elements_and_late_content(&rig);
     popups_join_the_session_and_close_with_it(&rig);
     frames_are_stitched_and_actionable(&rig);
+    cross_process_frames_are_stitched_and_actionable(&rig);
+    uploads_reach_inputs_and_file_choosers(&rig);
+    drags_move_html5_items_and_pointer_handles(&rig);
+    downloads_are_saved_where_asked(&rig);
+    console_and_errors_report_what_the_page_did(&rig);
+    network_log_bodies_blocking_and_har(&rig);
+    performance_reports(&rig);
     errors_from_local_pages_are_reported(&rig);
     screenshots_keep_the_page_as_it_was(&rig);
     labels_land_on_their_elements(&rig);
     permission_overrides_go_with_the_last_tab(&rig);
     extension_pages_let_go_of_websites(&rig);
+    extensions_are_developed_from_the_shell(&rig);
+    humanized_input_selects_fills_and_runs_in_frames(&rig);
     mocks_answer_cross_origin_preflights(&rig);
     scripts_run_many_commands_in_one_call(&rig);
     pointer_and_form_controls(&rig);
@@ -236,6 +275,28 @@ fn live() {
     navigations_that_never_commit_return_at_once(&rig);
     console_capture_stays_off_on_websites(&rig);
     history_restores_pages_without_repeating_their_console(&rig);
+}
+
+/// Runs hba with `args` until its output contains `needle` (at most 10 s) and returns it.
+fn until(rig: &Rig, session: &str, args: &[&str], needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = rig.ok(session, args);
+        if output.contains(needle) || Instant::now() > deadline {
+            assert!(output.contains(needle), "{args:?} never printed {needle:?}: {output}");
+            return output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The id of the extension a `ext load` line reports.
+fn extension_id(loaded: &str) -> String {
+    loaded
+        .split_whitespace()
+        .find(|word| word.len() == 32 && word.bytes().all(|c| (b'a'..=b'p').contains(&c)))
+        .unwrap_or_else(|| panic!("no extension id in {loaded:?}"))
+        .to_owned()
 }
 
 /// The `#log` line of the controls fixture.
@@ -425,7 +486,7 @@ fn adopted_tabs_are_released_not_closed(rig: &Rig) {
     // A release queues behind the session's running command, then takes the tab away.
     let released = thread::scope(|scope| {
         let waiting = scope.spawn(|| rig.ok(s, &["-T", &user_tab, "wait", "1500"]));
-        thread::sleep(Duration::from_millis(300));
+        rig.wait_for_log(&["adopt Wait", " started"]);
         let started = Instant::now();
         let released = rig.ok(s, &["tab", "release", &user_tab]);
         assert!(started.elapsed() > Duration::from_millis(800), "release did not wait: {released}");
@@ -646,11 +707,7 @@ fn extension_pages_let_go_of_websites(rig: &Rig) {
     let s = "ext";
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension");
     let loaded = rig.ok(s, &["ext", "load", dir.to_str().expect("utf-8 path")]);
-    let id = loaded
-        .split_whitespace()
-        .find(|word| word.len() == 32 && word.bytes().all(|c| (b'a'..=b'p').contains(&c)))
-        .unwrap_or_else(|| panic!("no extension id in {loaded:?}"))
-        .to_owned();
+    let id = extension_id(&loaded);
     rig.ok(s, &["ext", "open", &id, "options.html"]);
     let capturing = rig.ok(s, &["ext", "logs", &id]);
     assert!(capturing.contains("1 page"), "{capturing}");
@@ -791,4 +848,243 @@ fn history_restores_pages_without_repeating_their_console(rig: &Rig) {
     assert!(console.contains("history page restored"), "not restored from the back/forward cache: {console}");
     assert_eq!(console.matches("history page log").count(), 1, "{console}");
     rig.ok(s, &["close"]);
+}
+
+fn cross_process_frames_are_stitched_and_actionable(rig: &Rig) {
+    let s = "oopif";
+    rig.ok(s, &["open", &rig.url("oopif.html")]);
+    // The frame is another site (`localhost`), so it lives in its own process and loads later.
+    let snap = until(rig, s, &["snap"], "Inner submit");
+    let name = ref_of(&snap, "textbox \"Inner name\"");
+    let submit = ref_of(&snap, "button \"Inner submit\"");
+    assert!(name.starts_with('f') && submit.starts_with('f'), "{snap}");
+    rig.ok(s, &["fill", &name, "ada"]);
+    rig.ok(s, &["click", &submit]);
+    let diff = rig.ok(s, &["snap", "-d"]);
+    assert!(diff.contains("inner clicked ada"), "{diff}");
+    let frame = ref_of(&snap, "iframe");
+    assert_eq!(
+        rig.ok(s, &["js", "--frame", &frame, "document.getElementById('result').textContent"]).trim(),
+        "inner clicked ada"
+    );
+    rig.ok(s, &["close"]);
+}
+
+fn uploads_reach_inputs_and_file_choosers(rig: &Rig) {
+    let s = "upload";
+    let file = rig.root.join("report.txt");
+    fs::write(&file, "hello upload").expect("write the upload");
+    let path = file.to_str().expect("utf-8 path");
+    rig.ok(s, &["open", &rig.url("media-upload.html")]);
+    let direct = rig.ok(s, &["upload", "#file", path]);
+    assert!(direct.contains("uploaded report.txt"), "{direct}");
+    assert_eq!(rig.ok(s, &["text", "#status"]).trim(), "file: report.txt 12");
+    // The button opens a file chooser for a hidden input; hba answers it.
+    let chooser = rig.ok(s, &["upload", "text=Choose a photo", path]);
+    assert!(chooser.contains("uploaded report.txt"), "{chooser}");
+    assert_eq!(rig.ok(s, &["text", "#status"]).trim(), "hidden: report.txt 12");
+    let missing = rig.fails(s, &["upload", "#file", "/nonexistent/hba-upload.txt"]);
+    assert!(missing.contains("hba-upload.txt"), "{missing}");
+    rig.ok(s, &["close"]);
+}
+
+fn drags_move_html5_items_and_pointer_handles(rig: &Rig) {
+    let s = "drag";
+    rig.ok(s, &["open", &rig.url("media-drag.html")]);
+    let html5 = rig.ok(s, &["drag", "#item", "#zone"]);
+    assert!(html5.contains("HTML5 drag and drop"), "{html5}");
+    assert_eq!(rig.ok(s, &["text", "#status"]).trim(), "html5 dropped payload-42 (dragend move)");
+    // Without a draggable item the pointer path runs: real moves between press and release.
+    rig.ok(s, &["drag", "#handle", "#bin"]);
+    let status = rig.ok(s, &["text", "#status"]);
+    assert!(status.trim().starts_with("mouse dropped after "), "{status}");
+    rig.ok(s, &["close"]);
+}
+
+fn downloads_are_saved_where_asked(rig: &Rig) {
+    let s = "download";
+    let dir = rig.root.join("saved");
+    fs::create_dir_all(&dir).expect("create the download directory");
+    let dir_arg = dir.to_str().expect("utf-8 path");
+    rig.ok(s, &["open", &rig.url("media-download.html")]);
+    let linked = rig.ok(s, &["download", "#file", "-o", dir_arg]);
+    assert!(linked.contains("media-report.txt"), "{linked}");
+    assert_eq!(
+        fs::read_to_string(dir.join("media-report.txt")).expect("saved file"),
+        "hba download fixture\nline two\n"
+    );
+    // A file the page builds from a blob is saved too.
+    let generated = rig.ok(s, &["download", "#blob", "-o", dir_arg]);
+    assert!(generated.contains("media-generated.txt"), "{generated}");
+    assert_eq!(fs::read_to_string(dir.join("media-generated.txt")).expect("saved file"), "generated in the page\n");
+    let none = rig.fails(s, &["--timeout", "2", "download", "#nothing"]);
+    assert!(none.contains("started no download"), "{none}");
+    rig.ok(s, &["close"]);
+}
+
+fn console_and_errors_report_what_the_page_did(rig: &Rig) {
+    let s = "console";
+    rig.ok(s, &["open", &rig.url("devtools-console.html")]);
+    let logged = rig.ok(s, &["click", "#log"]);
+    assert!(logged.contains("! console.error: boom from devtools fixture"), "{logged}");
+    let console = rig.ok(s, &["console"]);
+    for line in [
+        "log loaded devtools console fixture",
+        "debug debug detail",
+        "info info message",
+        "warn first line",
+        "\n  second line",
+    ] {
+        assert!(console.contains(line), "{line:?} not in:\n{console}");
+    }
+    let thrown = rig.ok(s, &["click", "#throw"]);
+    assert!(thrown.contains("! Uncaught Error: kaboom from fixture"), "{thrown}");
+    let rejected = rig.ok(s, &["click", "#reject"]);
+    assert!(rejected.contains("! Uncaught (in promise) TypeError: rejected in fixture"), "{rejected}");
+    let failed = rig.ok(s, &["click", "#fail"]);
+    assert!(failed.contains("devtools-missing.json → 404"), "{failed}");
+    let errors = rig.ok(s, &["errors"]);
+    for line in [
+        "error Uncaught Error: kaboom from fixture",
+        "request #",
+        "devtools-missing.json → 404",
+        "http://127.0.0.1:9/unreachable",
+    ] {
+        assert!(errors.contains(line), "{line:?} not in:\n{errors}");
+    }
+    rig.ok(s, &["errors", "--clear"]);
+    assert!(!rig.ok(s, &["errors"]).contains("kaboom"), "errors survived --clear");
+    rig.ok(s, &["close"]);
+}
+
+fn network_log_bodies_blocking_and_har(rig: &Rig) {
+    let s = "net";
+    let har = rig.root.join("capture.har");
+    rig.ok(s, &["open", &rig.url("devtools-net.html")]);
+    until(rig, s, &["text", "#out"], "real data from the server");
+    rig.ok(s, &["net", "har", "start"]);
+    rig.ok(s, &["click", "#load"]);
+    rig.ok(s, &["click", "#post"]);
+    until(rig, s, &["text", "#posted"], "posted 200");
+    let fetched = rig.ok(s, &["net", "--type", "fetch", "--filter", "devtools-data.json"]);
+    let line = fetched.lines().find(|line| line.contains("GET")).unwrap_or_else(|| panic!("no GET in:\n{fetched}"));
+    let id = line.trim_start_matches('#').split_whitespace().next().expect("request number").to_owned();
+    let shown = rig.ok(s, &["net", "show", &id]);
+    assert!(shown.contains("GET") && shown.contains("application/json"), "{shown}");
+    assert!(rig.ok(s, &["net", "body", &id]).contains("real data from the server"));
+    let saved = rig.ok(s, &["net", "har", "stop", har.to_str().expect("utf-8 path")]);
+    assert!(saved.contains("saved"), "{saved}");
+    let recorded: serde_json::Value = serde_json::from_slice(&fs::read(&har).expect("HAR file")).expect("HAR is JSON");
+    let entries = recorded["log"]["entries"].as_array().expect("HAR entries");
+    let methods: Vec<_> = entries
+        .iter()
+        .filter(|e| e["request"]["url"].as_str().is_some_and(|u| u.contains("devtools-data.json")))
+        .map(|e| e["request"]["method"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(methods.contains(&"GET".to_owned()) && methods.contains(&"POST".to_owned()), "{methods:?}");
+    // A blocked request fails in the page; removing the rule restores it.
+    rig.ok(s, &["net", "block", "*devtools-data.json*"]);
+    rig.ok(s, &["click", "#load"]);
+    until(rig, s, &["text", "#out"], "failed:");
+    rig.ok(s, &["net", "unroute"]);
+    rig.ok(s, &["click", "#load"]);
+    until(rig, s, &["text", "#out"], "real data from the server");
+    rig.ok(s, &["close"]);
+}
+
+fn performance_reports(rig: &Rig) {
+    let s = "perf";
+    let artifact = |name: &str| rig.root.join(name);
+    rig.ok(s, &["open", &rig.url("devtools-perf.html")]);
+    let vitals = until(rig, s, &["perf", "vitals"], "(1 shift)");
+    assert!(vitals.contains("TTFB") && vitals.contains("LCP"), "{vitals}");
+    assert!(rig.ok(s, &["perf", "metrics"]).contains("js heap"));
+    rig.ok(s, &["perf", "coverage", "start"]);
+    rig.ok(s, &["reload"]);
+    let coverage = rig.ok(s, &["perf", "coverage", "stop"]);
+    assert!(coverage.contains("devtools-perf.js") && coverage.contains("devtools-perf.css"), "{coverage}");
+    let trace = artifact("trace.json");
+    rig.ok(s, &["perf", "trace", "start"]);
+    rig.ok(s, &["click", "#work"]);
+    let traced = rig.ok(s, &["perf", "trace", "stop", trace.to_str().expect("utf-8 path")]);
+    assert!(traced.contains("saved") && fs::metadata(&trace).is_ok_and(|m| m.len() > 0), "{traced}");
+    let profile = artifact("work.cpuprofile");
+    rig.ok(s, &["perf", "profile", "start"]);
+    rig.ok(s, &["click", "#work"]);
+    let profiled = rig.ok(s, &["perf", "profile", "stop", profile.to_str().expect("utf-8 path")]);
+    assert!(profiled.contains("fib (devtools-perf.js"), "{profiled}");
+    let heap = artifact("page.heapsnapshot");
+    let snapshot = rig.ok(s, &["perf", "heap", heap.to_str().expect("utf-8 path")]);
+    assert!(snapshot.contains("saved") && fs::metadata(&heap).is_ok_and(|m| m.len() > 0), "{snapshot}");
+    rig.ok(s, &["close"]);
+}
+
+fn extensions_are_developed_from_the_shell(rig: &Rig) {
+    let s = "extdev";
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension");
+    let dir = dir.to_str().expect("utf-8 path");
+    let id = extension_id(&rig.ok(s, &["ext", "load", dir]));
+    let listed = rig.ok(s, &["ext"]);
+    assert!(listed.contains(&id) && listed.contains("service worker running"), "{listed}");
+    assert_eq!(rig.ok(s, &["ext", "eval", &id, "chrome.runtime.getManifest().name"]).trim(), "hba test extension");
+    // Storage, by hand and through the extension's own code.
+    rig.ok(s, &["ext", "storage", &id, "local", "set", "key", r#"{"a":1}"#]);
+    assert_eq!(rig.ok(s, &["ext", "storage", &id, "local", "get", "key"]).trim(), r#"{"a":1}"#);
+    assert!(rig.ok(s, &["ext", "eval", &id, "await chrome.storage.local.get('key')"]).contains(r#""a":1"#));
+    rig.ok(s, &["ext", "storage", &id, "local", "rm", "key"]);
+    // A stopped worker starts again on request.
+    assert!(rig.ok(s, &["ext", "sw", &id, "stop"]).contains("stopped"));
+    assert!(rig.ok(s, &["ext", "sw", &id, "start"]).contains("started"));
+    // Recording runtime errors needs developer mode, which the first call turns on; that reloads
+    // the profile's extensions and holds navigations for a while.
+    let first = rig.ok(s, &["ext", "errors", &id]);
+    assert!(first.contains("developer mode"), "{first}");
+    rig.settle();
+    rig.ok(s, &["ext", "eval", &id, "hbaFail('from eval')"]);
+    until(rig, s, &["ext", "errors", &id], "hba fixture failure: from eval");
+    assert!(until(rig, s, &["ext", "logs", &id], "hba sw started").contains("sw.js"));
+    // The popup opens as a page of the current tab and works like one.
+    rig.ok(s, &["open", &rig.url("index.html")]);
+    let popup = rig.ok(s, &["ext", "popup", &id]);
+    assert!(popup.contains("popup.html"), "{popup}");
+    rig.ok(s, &["click", "text=Count click"]);
+    until(rig, s, &["text", "#clicks"], "1");
+    assert_eq!(rig.ok(s, &["ext", "storage", &id, "local", "get", "clicks"]).trim(), "1");
+    rig.ok(s, &["click", "text=Fail in worker"]);
+    until(rig, s, &["ext", "errors", &id], "popup button");
+    // The content script's world holds what the page's own world cannot see.
+    rig.ok(s, &["open", &rig.url("ext-page.html")]);
+    assert_eq!(rig.ok(s, &["js", "--world", &id, "hbaContent.title"]).trim(), "hba extension fixture");
+    assert_eq!(rig.ok(s, &["js", "typeof hbaContent"]).trim(), "undefined");
+    let reloaded = rig.ok(s, &["ext", "reload", dir]);
+    assert!(reloaded.contains("reloaded"), "{reloaded}");
+    assert!(rig.ok(s, &["ext", "sw", &id]).contains("running"));
+    rig.ok(s, &["ext", "rm", &id]);
+    rig.ok(s, &["close"]);
+}
+
+/// With `HBA_HUMANIZE=always` input goes through real mouse and key events even on local pages.
+fn humanized_input_selects_fills_and_runs_in_frames(rig: &Rig) {
+    let s = "human";
+    let human = |args: &[&str]| rig.ok_with(s, args, &[("HBA_HUMANIZE", "always")]);
+    human(&["open", &rig.url("controls.html")]);
+    human(&["select", "#plan", "Pro"]);
+    assert_eq!(human(&["text", "#log"]).trim(), "plan pro");
+    assert_eq!(human(&["get", "value", "#plan"]).trim(), "pro");
+    human(&["select", "#plan", "team"]);
+    assert_eq!(human(&["get", "value", "#plan"]).trim(), "team");
+    human(&["open", &rig.url("index.html")]);
+    // `fill` clicks the field to focus it, like a person.
+    human(&["fill", "internal:label=\"User\"", "alice"]);
+    assert_eq!(human(&["get", "value", "internal:label=\"User\""]).trim(), "alice");
+    // Statements, not only an expression, run in a frame.
+    human(&["open", &rig.url("page2.html")]);
+    let typed = human(&[
+        "js",
+        "--frame",
+        "iframe[title=Embedded]",
+        "const input = document.getElementById('inner'); input.value = 'typed'; input.value",
+    ]);
+    assert_eq!(typed.trim(), "typed");
+    human(&["close"]);
 }

@@ -1,10 +1,11 @@
 hba (Helium Browser Agent)
 Copyright 2026 Saatvik Sharma
 
-assets/playwright contains files from Playwright 1.64.1 (playwright-core), unmodified: the
-injected in-page script, the US keyboard layout and the device descriptors. At runtime hba
-renames the few identifiers the injected script makes visible to pages. Copyright (c)
-Microsoft Corporation, Apache License 2.0; its license and notice are in
+assets/playwright contains files derived from Playwright 1.64.1 (playwright-core) and modified:
+the injected in-page script (wrapped in a factory function and minified), and the US keyboard
+layout and the device descriptors (extracted to JSON; the descriptors keep only some fields). At
+runtime hba also renames the few identifiers the injected script makes visible to pages.
+Copyright (c) Microsoft Corporation, Apache License 2.0; its license and notice are in
 assets/playwright/LICENSE and assets/playwright/NOTICE. src/snapshot.rs ports Playwright's YAML
 rendering of accessibility snapshots, and src/keyboard.rs and src/actions.rs follow its
 key-chord and actionability rules.

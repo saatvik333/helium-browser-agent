@@ -74,7 +74,7 @@ By hand:
 ```sh
 cargo install --path . --locked     # installs ~/.cargo/bin/hba
 hba doctor                          # endpoint, profiles and daemon checks
-ln -s "$PWD/skill" ~/.agents/skills/hba
+mkdir -p ~/.agents/skills && ln -sfn "$PWD/skill" ~/.agents/skills/hba
 ```
 
 ## Commands
@@ -114,7 +114,7 @@ choice, a directory rule, the configured default, or the browser's last-used pro
 
 **Output.** Text is compact and meant to be read by a model; `--json` gives structured output for
 `tabs`, `status`, `open`, `tab`, `js`, `profiles` and others. Exit status 1 means the command failed
-(its message says why and usually what to run next); 2 means the command line was wrong.
+(its message says why and usually what to run next); 2 means the command line was wrong (also a bad script line for `run`).
 
 ## Configuration
 
@@ -129,20 +129,11 @@ actionability and settling, dialogs, stealth rules, and extension debugging.
 
 ## Development
 
-```sh
-cargo build
-cargo clippy --all-targets -- -D warnings
-cargo test                                   # unit and CLI tests
-HBA_LIVE=1 cargo test --test live            # end to end against a throwaway headless Helium
-HBA_LIVE=1 HBA_BROWSER=chrome HBA_HELIUM=/opt/google/chrome/chrome cargo test --test live   # the same against Chrome
-bun scripts/vendor-playwright.mjs            # refresh assets/playwright from the pinned version
-```
-
-The live tests start their own headless browser with a temporary profile and never touch your
-browser. They pass against Helium 156 and Chrome 156; Brave is untested. Approval mode is covered
-by a CLI test with a fake browser (one open request, a late Allow) and was checked by hand on
-Chrome 156, where clicking Allow needs a person. `HBA_TRACE=1` adds per-command timings to
-`$XDG_RUNTIME_DIR/hba/daemon.log`.
+[CONTRIBUTING](CONTRIBUTING.md) has the commands and the rules. The live tests start their own
+headless browser with a temporary profile and never touch your browser. They pass against Helium
+156 and Chrome 156; Brave is untested. Approval mode is covered by a CLI test with a fake browser
+(one open request, a late Allow) and was checked by hand on Chrome 156, where clicking Allow needs
+a person. `HBA_TRACE=1` adds per-command timings to `$XDG_RUNTIME_DIR/hba/daemon.log`.
 
 ## License
 

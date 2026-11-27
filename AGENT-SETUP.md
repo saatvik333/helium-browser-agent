@@ -45,16 +45,22 @@ For Brave, also tell `hba` which browser to drive (Brave support is untested):
 
 ```sh
 config="${XDG_CONFIG_HOME:-$HOME/.config}/hba/config.toml"
-mkdir -p "$(dirname "$config")" && grep -q '^browser' "$config" 2>/dev/null || echo 'browser = "brave"' >> "$config"
+mkdir -p "$(dirname "$config")" && { grep -q '^browser' "$config" 2>/dev/null || echo 'browser = "brave"' >> "$config"; }
 ```
 
 **Chrome**: Chrome ignores `--remote-debugging-port` on the user's own profile, and the flag even
 keeps remote debugging off there, so do not add it to `chrome-flags.conf` (remove it if it is
-there). Write `browser = "chrome"` to the config as above, then **ask the user** to open
-`chrome://inspect/#remote-debugging` in Chrome and turn on "Allow remote debugging for this
-browser instance". From then on Chrome asks them to Allow each new connection (`hba` keeps one
-open while its daemon runs), and shows a "Chrome is being controlled by automated test software"
-bar while `hba` is connected; that is expected.
+there). Tell `hba` which browser to drive:
+
+```sh
+config="${XDG_CONFIG_HOME:-$HOME/.config}/hba/config.toml"
+mkdir -p "$(dirname "$config")" && { grep -q '^browser' "$config" 2>/dev/null || echo 'browser = "chrome"' >> "$config"; }
+```
+
+Then **ask the user** to open `chrome://inspect/#remote-debugging` in Chrome and turn on "Allow
+remote debugging for this browser instance". From then on Chrome asks them to Allow each new
+connection (`hba` keeps one open while its daemon runs), and shows a "Chrome is being controlled
+by automated test software" bar while `hba` is connected; that is expected.
 
 Tell the user that DevTools access gives full control of the browser to local programs, which is
 why `hba` only accepts it on loopback.
@@ -65,6 +71,7 @@ Link the skill into every agent skills directory that exists on this machine, cr
 `~/.agents/skills` if none does:
 
 ```sh
+src="${XDG_DATA_HOME:-$HOME/.local/share}/hba"
 for dir in ~/.agents/skills ~/.claude/skills ~/.codex/skills; do
   [ -d "$dir" ] || [ "$dir" = ~/.agents/skills ] || continue
   mkdir -p "$dir" && ln -sfn "$src/skill" "$dir/hba"

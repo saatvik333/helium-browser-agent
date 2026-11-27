@@ -5,6 +5,10 @@
 <h1>Outer page</h1>
 <p id="outer-status">waiting</p>
 <div style="height: 120px"></div>
-<iframe title="Cross site" src="http://localhost:8765/inner.html" style="width: 420px; height: 160px; margin-left: 60px; border: 6px solid #888; padding: 4px"></iframe>
+<iframe title="Cross site" style="width: 420px; height: 160px; margin-left: 60px; border: 6px solid #888; padding: 4px"></iframe>
+<script>
+// `localhost` is another site than the fixture server's `127.0.0.1`, so the frame runs in its own process.
+document.querySelector('iframe').src = location.origin.replace('127.0.0.1', 'localhost') + '/inner.html';
+</script>
 </body>
 </html>

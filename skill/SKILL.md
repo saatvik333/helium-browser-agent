@@ -23,9 +23,10 @@ hba snap -d                     # only what changed since the last snapshot
   `'text=Sign in'`, `'role=button[name="Save"]'`, `'internal:label="Email"i'` (`i`: any case, part
   of the label; without it the whole label must match). `hba get locator e12` prints a stable one.
 - `snap` = full page (Playwright AI format, compacted). `-i` actions only, `-v` viewport only,
-  `-S e40` one subtree, `-d` diff, `--boxes` coordinates. Long output spills to a file.
+  `-S e40` one subtree, `-d` diff, `--boxes` coordinates. Long output spills to a file
+  (shots, PDFs, traces and spills are deleted after a day).
 - `find 'checkout'` finds elements by text/name without printing the whole page.
-- Read content: `hba text` (whole page) or `hba text e40`; `hba get url|title|value|attr|html|count|box|style|locator TARGET`;
+- Read content: `hba text` (whole page) or `hba text e40`; `hba get url|title|value|attr|html|inner|count|box|style|locator TARGET`;
   `hba is visible|enabled|checked|editable|focused TARGET` → true/false.
 
 ## Acting
@@ -50,15 +51,15 @@ fails with the blocker's description (`click --force` skips the checks). `click`
 - `hba tab new [URL]`, `hba tab close [t5]`, `hba tab front` (show it to the user), `-T t6` to target a
   session tab once without switching.
 - **The user's own tabs are off-limits until you adopt one on request:** `hba tab use t42` (from
-  `tabs --all`) makes it current; `hba tab release` hands it back untouched (so does `hba close`).
+  `tabs --all`) makes it current; `hba tab release` hands it back untouched.
   `hba tab close` closes an adopted tab for good: never navigate or close one unless that is the
   request.
 - Profiles: `hba profiles`; `-p Work` (display name, directory or configured alias) picks the profile
   for new tabs; project directories can map to profiles in `~/.config/hba/config.toml`.
 - `hba window maximized|minimized|normal|fullscreen`, `hba window size 1280x800` change the tab's
   window.
-- `hba status` summarizes; `hba close` closes the session's own tabs and releases adopted ones —
-  run it when the task is done.
+- `hba status` summarizes. Run `hba close` when the task is done: it closes the session's own tabs
+  and releases adopted ones.
 
 ## Scripts and escape hatches
 - `hba js 'expr'` runs in the page (top-level `await` ok; `--frame e5` for an iframe; `-` reads stdin).
@@ -78,7 +79,7 @@ fails with the blocker's description (`click --force` skips the checks). `click`
   the browser's window is hidden; only captures past the viewport (`--full`, a tall `-e`) need it on screen.
 - `hba emulate --device 'iPhone 15' | --viewport 390x844 --dpr 3 --mobile | --tz Asia/Tokyo |
   --locale de-DE | --geo 48.85,2.35 | --scheme dark | --network slow3g | --cpu 4`; `--reset`.
-- `hba cookies`, `hba storage [local|session] …`, `hba state save|load f.json`, `hba perms grant geolocation`.
+- `hba cookies`, `hba storage [local|session] …`, `hba state save|load f.json` (load replaces the site's cookies and the saved storage areas), `hba perms grant geolocation`.
 - `hba clip` prints the system clipboard (`hba clip TEXT` sets it), e.g. to check a page's Copy button.
 - `hba devtools console` opens DevTools for the user to watch.
 
@@ -105,12 +106,6 @@ hba js --world my-ext 'window.contentState'   # in the content script's world (t
   usage.
 - Login walls, MFA, captchas, purchases and anything irreversible: stop and ask the user.
 - `hba doctor` diagnoses connection problems; `hba browser launch|restart|endpoint`.
-- **Approval mode** (Chrome's own profile, or any browser whose remote debugging was turned on at
-  `chrome://inspect/#remote-debugging` instead of with a flag): the browser asks the user to allow
-  each new DevTools connection and shows an automation notice while `hba` is connected. A command
-  failing with "did not allow the DevTools connection … click Allow" means the dialog is waiting:
-  ask the user to click Allow, then run the command again (`--timeout 120` gives them longer). The
-  request stays open after a command gives up, so an Allow clicked later still counts; don't
-  restart anything, and don't run `hba daemon stop` to "retry": every abandoned request leaves a
-  dead dialog in front of the next one. One Allow lasts as long as the `hba` daemon runs, which
-  in this mode does not exit for idleness.
+- **Approval mode** (Chrome's own profile): on "did not allow the DevTools connection … click
+  Allow", ask the user to click Allow and rerun the command (`--timeout 120` gives them longer).
+  Never restart anything or run `hba daemon stop` to retry.

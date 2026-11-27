@@ -3,7 +3,10 @@
 `hba` needs no configuration when Helium uses its default data directory and `helium-browser` is
 on `PATH`. For Chrome or Brave, set `browser`. Settings come from `$XDG_CONFIG_HOME/hba/config.toml`
 (or the file named by `HBA_CONFIG`) and from `HBA_*` variables; a variable overrides the file. The
-daemon reloads the file when it changes.
+daemon reads it again before each command: a different `browser` or `user_data_dir` reconnects, and
+`humanize` and `launcher` apply at their next use. When the browser is launched or relaunched with
+a `user_data_dir` that is not its default, `--user-data-dir` is passed; `hba browser restart` keeps
+a `--remote-debugging-port` from the old command line.
 
 Everything is validated when it is read. An unknown key, a wrong type, an empty value or a bad
 variable stops the command with an error naming the file, key or variable.
@@ -22,7 +25,7 @@ variable stops the command with an error naming the file, key or variable.
 | | `HBA_CDP` | discovery | A `ws://` DevTools URL to use instead of discovering and verifying the browser's endpoint. |
 | | `HBA_SESSION` | project directory name | Default for `-s`: the git root's name, else the working directory's. 1–48 characters of `A-Z a-z 0-9 . _ -`. |
 | | `HBA_PROFILE` | | Default for `-p`. |
-| | `HBA_TRACE` | off | `1` writes per-command timings to the daemon log. |
+| | `HBA_TRACE` | off | `1` writes per-command timings to the daemon log. Lines name the command, never its arguments. |
 
 ```toml
 # ~/.config/hba/config.toml
@@ -99,6 +102,10 @@ never do.
 
 `$XDG_RUNTIME_DIR/hba/` holds the daemon socket (`hba.sock`), its lock, its log (`daemon.log`) and
 `state.json` (sessions, their tabs and which browser context is which profile). They are recreated
-as needed; deleting the directory while no daemon runs resets every session. Without
-`XDG_RUNTIME_DIR`, `$TMPDIR/hba-UID` (`/tmp/hba-UID` by default) is used, and it must be a private
-(0700) directory of yours, not a link.
+as needed; deleting the directory while no daemon runs resets every session. A `state.json` that
+cannot be read is renamed to `state.json.damaged` and the daemon starts empty; no listed tab is
+closed. `files/` holds what commands write for you (screenshots, PDFs, HARs, traces, heap
+snapshots); entries older than a day are deleted when a daemon starts and whenever a new one is
+written. A `daemon.log` over 1 MiB is moved to `daemon.log.old` when a daemon starts. Without `XDG_RUNTIME_DIR`,
+`$TMPDIR/hba-UID` (`/tmp/hba-UID` by default) is used, and it must be a private (0700) directory of
+yours, not a link.

@@ -20,20 +20,22 @@ hba close                             # closes the tabs this session opened
   that browser.
 - **Your tabs stay yours.** An agent can act only on tabs it opened, or on one you hand it with
   `hba tab use t42`. `hba tab release` gives that tab back.
-- **Milliseconds per command.** A small background process keeps one connection open. Reading a
-  page takes 2–4 ms and a snapshot 12–21 ms, measured on Helium with 97 open tabs
-  ([details](docs/architecture.md#performance)).
-- **Acts like a person on websites.** Clicks and keystrokes are real input events, with human
-  pacing on websites. hba's page code runs where page scripts can't see it, and the debugging
-  features that anti-bot scripts look for stay off on websites unless you turn them on.
+- **Milliseconds per command.** A small background process keeps one connection open. With hba
+  0.2.0 on Helium (52 open tabs, example.com), `get url` and `text` took 7–11 ms and `snap` 9–14 ms
+  after the first call, client process included ([more timings](docs/architecture.md#performance)).
+- **Acts like a person on websites.** Clicks, keystrokes and single-choice `select` are real
+  input events, with human pacing on websites; only date, time, color and range fields and
+  multi-selects are set by script, because no key sequence can set them. hba's page code runs
+  where page scripts can't see it, and the debugging features that anti-bot scripts look for stay
+  off on websites unless you turn them on.
 - **DevTools from the shell.** Console and errors, the network log with bodies, blocking and mocks,
   HAR files, performance traces, CPU profiles, heap snapshots, coverage, web vitals, emulation,
   cookies and storage.
 - **Extension development.** Load, reload and remove unpacked extensions, read their logs, errors
   and storage, evaluate code in their service worker or content script, and use the popup like a
   page.
-- **Written for models.** Commands print compact text, one fact per line, and errors say which
-  command to run next. `--json` is there when you need structured output.
+- **Written for models.** Commands print compact text, one fact per line, and errors usually say
+  which command to run next. `--json` is there when you need structured output.
 
 Snapshots, selectors and the checks before each click come from [Playwright](https://playwright.dev/)'s
 page script, copied into this repo at a pinned version.

@@ -201,8 +201,8 @@ a quick viewport capture and fails within about 4 s if the browser does not draw
 
 ## Performance
 
-Measured against the author's Helium 156 (97 open tabs, window on another workspace) with the
-release build; times include the client process.
+Measured with hba 0.1.0 against the author's Helium 156 (97 open tabs, window on another
+workspace) with the release build; times include the client process.
 
 | Command | Time |
 | --- | --- |

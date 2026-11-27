@@ -86,6 +86,12 @@ impl Profiles {
         self.list.iter().find(|profile| profile.dir == dir)
     }
 
+    /// The browser's default profile: the last-used one, where the protocol's `Extensions`
+    /// domain installs.
+    pub fn default_dir(&self) -> &str {
+        self.last_used.as_deref().unwrap_or("Default")
+    }
+
     /// Resolves an alias, display name, directory, or unambiguous case-insensitive part of a name.
     pub fn resolve(&self, query: &str, aliases: &BTreeMap<String, String>) -> Result<&Profile> {
         let query = query.trim();

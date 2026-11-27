@@ -19,6 +19,7 @@ variable stops the command with an error naming the file, key or variable.
 | `default_profile` | | the browser's last-used profile | Profile for new tabs when no flag, variable, session or directory rule picks one. Display name or directory (`Default`, `Profile 3`). |
 | `humanize` | `HBA_HUMANIZE` | `auto` | Input timing. `auto`: curved mouse paths and typing rhythm on websites, instant on local, file and extension pages. `always` or `never`. |
 | `idle_minutes` | | `30` | The daemon exits after this many minutes with no command running; `0` keeps it running. In approval mode it stays while it holds a connection or a request awaiting Allow, since a new daemon means a new dialog. While the file does not load, the default applies. Tabs stay open either way. |
+| `tab_groups` | | `true` | Put agent tabs in a tab group titled `hba`, one per window, so you see where agents work. Needs hba's extension, written to `$XDG_DATA_HOME/hba/extension`: `hba` loads it into the browser's last-used profile itself (until the browser restarts); other profiles need it loaded once by hand with Load unpacked, and `hba` says so the first time. `false` turns grouping off. |
 | `[aliases]` | | | Short profile names: `work = "Client Work"` makes `-p work` pick that profile. |
 | `[workspaces]` | | | Directory to profile rules for new tabs. Keys must be absolute directories or start with `~/`. The longest matching directory wins; matching is by whole path components. |
 | | `HBA_CONFIG` | `$XDG_CONFIG_HOME/hba/config.toml` | The config file. When set, the file must exist. |

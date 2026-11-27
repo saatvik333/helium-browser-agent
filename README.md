@@ -118,6 +118,12 @@ one at a time, so a release takes effect after the command already running on th
 Ownership is saved to disk and survives a daemon restart; a browser restart ends it, because tab
 numbers start over.
 
+**Tab groups.** Agent tabs sit in a tab group named `hba` in each window, so you can see where
+agents work. Grouping goes through a small extension, also named `hba`, that `hba` loads into the
+browser's last-used profile; for other profiles, load `~/.local/share/hba/extension` once at the
+browser's extensions page (developer mode, Load unpacked). `tab_groups = false` in the config turns
+it off.
+
 **Profiles.** New tabs open in the profile chosen by `-p`/`$HBA_PROFILE`, the session's earlier
 choice, a directory rule, the configured default, or the browser's last-used profile, in that order.
 

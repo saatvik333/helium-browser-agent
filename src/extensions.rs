@@ -8,6 +8,7 @@
 
 mod catalog;
 mod debugger;
+pub mod groups;
 mod manager;
 
 use std::fmt::Write as _;
@@ -127,7 +128,7 @@ impl Scope {
         let browser = cx.browser().await?;
         let profile = cx.profile(&browser)?;
         let profiles = browser.profiles()?;
-        let default_dir = profiles.last_used.clone().unwrap_or_else(|| "Default".to_owned());
+        let default_dir = profiles.default_dir().to_owned();
         let default =
             profiles.by_dir(&default_dir).cloned().unwrap_or(Profile { name: default_dir.clone(), dir: default_dir });
         let context = browser.contexts().into_iter().find(|(_, dir)| *dir == profile.dir).map(|(context, _)| context);

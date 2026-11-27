@@ -94,6 +94,18 @@ touches one only after `hba tab use`, which marks it adopted. `hba close` and `h
 detach an adopted tab without closing it; `hba tab close` closes it. Tab numbers (`t5`) are stable
 for the browser's lifetime and start over when it restarts, which ends every session's ownership.
 
+Agent tabs, popups included, go into one tab group per window titled `hba`; adopted tabs stay
+where the user keeps them, a tab already in a group is left in it, and popup windows have no
+groups. The protocol has no tab-group command, so `hba` ships an extension named `hba`
+(`assets/extension`, a fixed id through its manifest `key`) and evaluates `group(...)` in its
+service worker, which maps page targets to tabs with `chrome.debugger.getTargets` (no attach, no
+infobar). A profile has the helper when its worker runs in the tab's browser context; a stopped one
+is started with `ServiceWorker.startWorker` through the new tab's session when the profile's
+preferences record the helper. The `Extensions` domain installs into the browser's last-used
+profile (live, which `Local State` on disk trails), so `hba` loads the helper only when the tab's
+profile is that one, and other profiles need it loaded by hand. A profile found without it is looked
+at again once its preferences change. Grouping failures are a `note:` line, never a failed command.
+
 ## The page engine
 
 `hba` runs Playwright's injected script (`assets/playwright/injected.js`, pinned by

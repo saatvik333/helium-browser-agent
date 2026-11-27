@@ -261,7 +261,7 @@ async fn to_frame(page: &Page, element: &Element, point: (f64, f64)) -> Result<(
 /// Settles after an action and reports navigation, popups, dialogs, errors and downloads.
 pub async fn after(
     cx: &mut Cx<'_>,
-    browser: &Browser,
+    browser: &Arc<Browser>,
     page: &Arc<Page>,
     mark: &Mark,
     watch: crate::daemon::PopupWatch,

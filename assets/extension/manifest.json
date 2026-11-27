@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "hba",
+  "version": "1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvD0Si7ZlSYT08MN+6O5W+ajR4OXVlKtDDl8YzpGsw2/t1ZPFwanG6MgIM/WYa1k2Fqx7dwcUQCHEOggAaL1r9JGhz15/DtEGI5IwnJQtGyelIXYzXU+qS/OBRSd+3yjDc0X7ldLXRVjMEtHbOmTFzDSyrGzTOAsoEPQoAcvnC7M2pWDXPcykfgMmlQ4IuMPUc3xVJsAdcO1aNuTVsK1/k0eY9GcoWbhrH9Oc8xX1MOc3y5CaTpb/W6Odkl29fRuPe2ARAdH+G0a3sTfnm4KShBrKMugqKbIBZWO+u/lEEEKj+1yMBuIzFOU4kcuPtPluJPVez4u69d+i7VQmIGVyfwIDAQAB",
+  "minimum_chrome_version": "149",
+  "permissions": ["tabs", "tabGroups", "debugger"],
+  "background": {"service_worker": "worker.js"}
+}

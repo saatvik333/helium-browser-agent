@@ -72,6 +72,8 @@ pub struct Browser {
     pub world: Arc<crate::injected::Source>,
     /// Extension service-worker sessions and their logs.
     pub extensions: Mutex<crate::extensions::State>,
+    /// Profiles found without hba's extension.
+    pub tab_groups: Mutex<crate::extensions::groups::Missing>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +114,7 @@ impl Browser {
             events,
             world,
             extensions: Mutex::default(),
+            tab_groups: Mutex::default(),
         });
         tokio::spawn(Self::pump(Arc::downgrade(&browser), events_rx));
         browser

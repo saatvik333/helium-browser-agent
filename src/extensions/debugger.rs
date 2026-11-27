@@ -344,7 +344,7 @@ async fn attach(browser: &Arc<Browser>, target: &TargetInfo, extension: &str, ki
 
 /// Attaches to `target` for one command, in a task of its own: the lease detaches the session
 /// when it ends or is dropped, which a command cancelled meanwhile does once the task ends.
-async fn single_use(browser: &Arc<Browser>, target: &TargetInfo, kind: Kind) -> Result<Lease> {
+pub async fn single_use(browser: &Arc<Browser>, target: &TargetInfo, kind: Kind) -> Result<Lease> {
     let (browser, target) = (Arc::clone(browser), target.clone());
     crate::devtools::to_completion(async move {
         let session = connect(&browser, &target, kind, None).await?;

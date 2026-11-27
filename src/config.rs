@@ -102,6 +102,8 @@ pub struct Config {
     /// Daemon exits after this long without requests (`None` = never).
     pub idle: Option<Duration>,
     pub humanize: Humanize,
+    /// Session tabs go into a tab group per session.
+    pub tab_groups: bool,
     /// Explicit DevTools WebSocket URL; skips discovery and owner verification.
     pub cdp_url: Option<String>,
     /// `user_data_dir` is the browser's default one.
@@ -118,6 +120,7 @@ struct File {
     default_profile: Option<String>,
     idle_minutes: Option<u64>,
     humanize: Option<Humanize>,
+    tab_groups: Option<bool>,
     #[serde(default)]
     aliases: BTreeMap<String, String>,
     #[serde(default)]
@@ -225,6 +228,7 @@ impl Config {
             workspaces,
             idle,
             humanize,
+            tab_groups: file.tab_groups.unwrap_or(true),
             cdp_url,
             default_data_dir,
             source,

@@ -788,6 +788,9 @@ impl Cx<'_> {
             session.current = Some(tab.clone());
         })?;
         let page = browser.attach(&tab).await?;
+        if let Some(target) = page.page_target() {
+            self.group(&browser, &page, &[target]).await;
+        }
         if front {
             browser.cdp.send("Target.activateTarget", serde_json::json!({"targetId": tab}), None).await?;
         }
@@ -821,12 +824,13 @@ impl Cx<'_> {
 
     /// Tabs opened by `page` during the watch join the session as its own tabs. When a popup
     /// took over the user's view, the tab they were looking at is shown again.
-    pub async fn adopt_popups(&mut self, browser: &Browser, page: &Page, mut watch: PopupWatch) -> Result<()> {
+    pub async fn adopt_popups(&mut self, browser: &Arc<Browser>, page: &Page, mut watch: PopupWatch) -> Result<()> {
         let Some(opener) = page.page_target() else { return Ok(()) };
         let popups = popups_of(&mut watch.events, &opener);
         if popups.is_empty() {
             return Ok(());
         }
+        let mut grouped = Vec::new();
         for popup in &popups {
             if let Some(tab) = browser.tab_of_page(&popup.target_id, &popup.url).await? {
                 self.update_session(|session| session.add(&tab, false))?;
@@ -837,13 +841,32 @@ impl Cx<'_> {
                     "+ popup {label} {} — `hba tab use {label}`",
                     crate::output::short_url(&url, 100)
                 );
+                grouped.push(popup.target_id.clone());
             }
         }
+        self.group(browser, page, &grouped).await;
         let now = shown_tabs(&browser.tabs().await?);
         for hidden in watch.shown.iter().filter(|tab| !now.contains(tab)) {
             browser.cdp.send("Target.activateTarget", serde_json::json!({"targetId": hidden}), None).await.ok();
         }
         Ok(())
+    }
+
+    /// Puts session tabs (page target ids) in the agents' tab group; `via` is a page in their
+    /// profile. Grouping only shows the user where agents work, so a failure is a note.
+    async fn group(&mut self, browser: &Arc<Browser>, via: &Page, pages: &[String]) {
+        if pages.is_empty() {
+            return;
+        }
+        let note = match crate::extensions::groups::add(browser, via, pages).await {
+            Ok(hint) => hint,
+            Err(error) => Some(format!("tabs are not grouped: {error:#}")),
+        };
+        if let Some(note) = note
+            && !self.json
+        {
+            self.say(format!("note: {note}"));
+        }
     }
 }
 

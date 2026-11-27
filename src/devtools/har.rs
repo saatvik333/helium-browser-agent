@@ -89,12 +89,10 @@ impl Phases {
 }
 
 /// A HAR 1.2 log of `requests`; `bodies[i]` is the response body of `requests[i]`, if fetched.
-pub fn build(requests: &[Request], bodies: &[Option<Body>], version: &str) -> Value {
-    let entries: Vec<Value> = requests
-        .iter()
-        .enumerate()
-        .map(|(index, request)| entry(request, bodies.get(index).and_then(Option::as_ref)))
-        .collect();
+/// The bodies are moved into the document: they run to megabytes.
+pub fn build(requests: &[Request], bodies: Vec<Option<Body>>, version: &str) -> Value {
+    let mut bodies = bodies.into_iter();
+    let entries: Vec<Value> = requests.iter().map(|request| entry(request, bodies.next().flatten())).collect();
     json!({
         "log": {
             "version": "1.2",
@@ -104,7 +102,7 @@ pub fn build(requests: &[Request], bodies: &[Option<Body>], version: &str) -> Va
     })
 }
 
-fn entry(request: &Request, body: Option<&Body>) -> Value {
+fn entry(request: &Request, body: Option<Body>) -> Value {
     let phases = Phases::of(request);
     let http_version = http_version(request.protocol.as_deref());
     let mut har_request = json!({
@@ -122,11 +120,11 @@ fn entry(request: &Request, body: Option<&Body>) -> Value {
         har_request["postData"] = json!({"mimeType": mime, "text": text});
     }
     let mut content = json!({
-        "size": body.map_or(request.body_size, |body| body.decoded_len() as u64),
+        "size": body.as_ref().map_or(request.body_size, |body| body.decoded_len() as u64),
         "mimeType": request.mime.as_deref().unwrap_or("x-unknown"),
     });
     if let Some(body) = body {
-        content["text"] = json!(body.text);
+        content["text"] = Value::String(body.text);
         if body.base64 {
             content["encoding"] = json!("base64");
         }
@@ -289,7 +287,7 @@ mod tests {
     #[test]
     fn har_entries_carry_request_response_body_and_timings() {
         let body = Body { text: "eyJvayI6dHJ1ZX0=".to_owned(), base64: true };
-        let har = build(&[request()], &[Some(body)], "1.0.0");
+        let har = build(&[request()], vec![Some(body)], "1.0.0");
         let log = &har["log"];
         assert_eq!(log["version"], "1.2");
         assert_eq!(log["creator"]["name"], "hba");

@@ -2,7 +2,7 @@
 //! tab's state for recordings that span two commands.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use serde_json::value::RawValue;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
-use super::{coverage, vitals};
+use super::{coverage, file_goes_with_stop, output_path, to_completion, vitals};
 use crate::cdp::{Cdp, Event};
 use crate::cli::{PerfOp, StartStop};
 use crate::daemon::Cx;
@@ -98,8 +98,16 @@ pub fn on_event(page: &Page, event: &Event) {
                 .as_mut()
                 .filter(|trace| event.session.as_deref() == Some(&*trace.session))
                 .and_then(|trace| trace.complete.take());
-            if let Some(waiter) = waiter {
-                let _ = waiter.send(complete.stream);
+            // A stream nobody waits for (its `stop` gave up) would keep the whole trace in the browser.
+            let unclaimed = match waiter {
+                Some(waiter) => waiter.send(complete.stream).err().flatten(),
+                None => complete.stream,
+            };
+            if let (Some(stream), Some(session)) = (unclaimed, event.session.clone()) {
+                let cdp = page.cdp.clone();
+                tokio::spawn(async move {
+                    cdp.send("IO.close", json!({"handle": stream}), Some(&session)).await.ok();
+                });
             }
         }
         "CSS.styleSheetAdded" => coverage::on_style_sheet(page, event),
@@ -114,38 +122,31 @@ pub async fn perf(cx: &mut Cx<'_>, op: PerfOp) -> Result<()> {
         PerfOp::Metrics => metrics(cx, &page).await,
         PerfOp::Vitals => vitals::report(cx, &page).await,
         PerfOp::Trace { action: StartStop::Start, path } => {
-            file_goes_with_stop("trace", path.as_deref())?;
-            trace_start(cx, &page).await
+            file_goes_with_stop("perf trace stop", path.as_deref())?;
+            begin_trace(&page).await?;
+            cx.say(format!(
+                "tracing {}; `hba perf trace stop FILE` saves it for DevTools' Performance panel",
+                cx.tab_number(&page.tab)
+            ));
+            Ok(())
         }
         PerfOp::Trace { action: StartStop::Stop, path } => trace_stop(cx, &page, path.as_deref()).await,
         PerfOp::Profile { action: StartStop::Start, path } => {
-            file_goes_with_stop("profile", path.as_deref())?;
-            profile_start(cx, &page).await
+            file_goes_with_stop("perf profile stop", path.as_deref())?;
+            begin_profile(&page).await?;
+            cx.say(format!(
+                "profiling JavaScript on {}; `hba perf profile stop FILE` saves it",
+                cx.tab_number(&page.tab)
+            ));
+            Ok(())
         }
         PerfOp::Profile { action: StartStop::Stop, path } => profile_stop(cx, &page, path.as_deref()).await,
         PerfOp::Heap { path } => heap(cx, &page, path.as_deref()).await,
         PerfOp::Coverage { action: StartStop::Start, output } => {
-            if let Some(output) = output {
-                bail!("-o goes with stop: `hba perf coverage stop -o {}`", output.display());
-            }
+            file_goes_with_stop("perf coverage stop -o", output.as_deref())?;
             coverage::start(cx, &page).await
         }
         PerfOp::Coverage { action: StartStop::Stop, output } => coverage::stop(cx, &page, output.as_deref()).await,
-    }
-}
-
-fn file_goes_with_stop(what: &str, path: Option<&Path>) -> Result<()> {
-    match path {
-        Some(path) => bail!("the file goes with stop: `hba perf {what} stop {}`", path.display()),
-        None => Ok(()),
-    }
-}
-
-/// `path` against the caller's directory, or a new file in the runtime directory.
-fn output_path(cx: &Cx<'_>, path: Option<&Path>, stem: &str, extension: &str) -> Result<PathBuf> {
-    match path {
-        Some(path) => Ok(cx.path(path)),
-        None => cx.artifact(stem, extension),
     }
 }
 
@@ -217,28 +218,32 @@ fn metric_lines(values: &BTreeMap<String, f64>, previous: Option<(&BTreeMap<Stri
     lines
 }
 
-async fn trace_start(cx: &mut Cx<'_>, page: &Page) -> Result<()> {
-    if page.devtools.lock().expect("devtools lock").trace.is_some() {
-        bail!("a trace is already recording on this tab; `hba perf trace stop FILE` saves it");
-    }
+/// Starts a trace on the page session. The trace is recorded first and forgotten if the browser
+/// refuses it, in a task of its own, so a client that hangs up leaves it recording and recorded.
+async fn begin_trace(page: &Arc<Page>) -> Result<()> {
     let session = page.session()?;
-    let params = json!({
-        "transferMode": "ReturnAsStream",
-        "streamFormat": "json",
-        "streamCompression": "none",
-        "traceConfig": {"includedCategories": TRACE_CATEGORIES, "excludedCategories": ["*"]},
-    });
-    page.cdp
-        .send("Tracing.start", params, Some(&session))
-        .await
-        .context("starting the trace (is DevTools recording a performance profile?)")?;
-    page.devtools.lock().expect("devtools lock").trace =
-        Some(Trace { session, started: Instant::now(), complete: None });
-    cx.say(format!(
-        "tracing {}; `hba perf trace stop FILE` saves it for DevTools' Performance panel",
-        cx.tab_number(&page.tab)
-    ));
-    Ok(())
+    {
+        let mut state = page.devtools.lock().expect("devtools lock");
+        if state.trace.is_some() {
+            bail!("a trace is already recording on this tab; `hba perf trace stop FILE` saves it");
+        }
+        state.trace = Some(Trace { session: Arc::clone(&session), started: Instant::now(), complete: None });
+    }
+    let page = Arc::clone(page);
+    to_completion(async move {
+        let params = json!({
+            "transferMode": "ReturnAsStream",
+            "streamFormat": "json",
+            "streamCompression": "none",
+            "traceConfig": {"includedCategories": TRACE_CATEGORIES, "excludedCategories": ["*"]},
+        });
+        let started = page.cdp.send("Tracing.start", params, Some(&session)).await;
+        if started.is_err() {
+            page.devtools.lock().expect("devtools lock").trace = None;
+        }
+        started.context("starting the trace (is DevTools recording a performance profile?)")
+    })
+    .await
 }
 
 async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> Result<()> {
@@ -250,13 +255,13 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
     };
     let path = output_path(cx, path, "trace", "json")?;
     let name = cx.config()?.browser.name();
-    // Ending the trace is final, so the file is opened first.
-    let file = output::create(&path)?;
+    // Ending the trace is final, so the file is opened first. Traces hold every request's URL.
+    let file = output::create_private(&path).with_context(|| format!("creating {}", path.display()))?;
     let traced = started.elapsed();
     let timeout = cx.timeout;
     let (page, saved_to) = (Arc::clone(page), path.clone());
     // Its own task, so a client that hangs up still gets the trace saved and its stream closed.
-    let written = tokio::spawn(async move {
+    let written = to_completion(async move {
         let complete = {
             let mut state = page.devtools.lock().expect("devtools lock");
             let trace = state.trace.as_mut().context("the trace was stopped meanwhile")?;
@@ -268,7 +273,12 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
             page.cdp.send("Tracing.end", json!({}), Some(&session)).await?;
             let stream = tokio::time::timeout(timeout, complete)
                 .await
-                .with_context(|| format!("{name} did not finish the trace in time; retry with a larger --timeout"))?
+                .with_context(|| {
+                    format!(
+                        "{name} did not finish the trace in time, so it is lost; start a new one and stop it \
+                         with a larger --timeout"
+                    )
+                })?
                 .context("the tab went away before the trace finished")?
                 .context("the trace came back without data")?;
             crate::media::save_stream(&page.cdp, &session, &stream, file, &saved_to).await
@@ -277,7 +287,7 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
         page.devtools.lock().expect("devtools lock").trace = None;
         saved
     })
-    .await??;
+    .await?;
     cx.say(format!(
         "saved {} ({}, {} traced); open it in DevTools' Performance panel",
         path.display(),
@@ -287,21 +297,43 @@ async fn trace_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> R
     Ok(())
 }
 
-async fn profile_start(cx: &mut Cx<'_>, page: &Page) -> Result<()> {
-    if page.devtools.lock().expect("devtools lock").profiling() {
-        bail!("a CPU profile is already recording on this tab; `hba perf profile stop FILE` saves it");
-    }
+/// Starts sampling JavaScript on the page session. The profile is recorded first, so coverage
+/// leaves the Profiler on meanwhile; a refusal forgets it and turns the Profiler off again. In a
+/// task of its own, so a client that hangs up leaves it sampling and recorded.
+async fn begin_profile(page: &Arc<Page>) -> Result<()> {
     let session = page.session()?;
-    let s = Some(&*session);
-    page.cdp.send("Profiler.enable", json!({}), s).await?;
-    page.cdp
-        .send("Profiler.setSamplingInterval", json!({"interval": SAMPLING_INTERVAL_US}), s)
-        .await
-        .context("setting the sampling interval (is DevTools profiling this tab?)")?;
-    page.cdp.send("Profiler.start", json!({}), s).await?;
-    page.devtools.lock().expect("devtools lock").profile = Some(session);
-    cx.say(format!("profiling JavaScript on {}; `hba perf profile stop FILE` saves it", cx.tab_number(&page.tab)));
-    Ok(())
+    {
+        let mut state = page.devtools.lock().expect("devtools lock");
+        if state.profiling() {
+            bail!("a CPU profile is already recording on this tab; `hba perf profile stop FILE` saves it");
+        }
+        state.profile = Some(Arc::clone(&session));
+    }
+    let page = Arc::clone(page);
+    to_completion(async move {
+        let s = Some(&*session);
+        let started = async {
+            page.cdp.send("Profiler.enable", json!({}), s).await?;
+            page.cdp
+                .send("Profiler.setSamplingInterval", json!({"interval": SAMPLING_INTERVAL_US}), s)
+                .await
+                .context("setting the sampling interval (is DevTools profiling this tab?)")?;
+            page.cdp.send("Profiler.start", json!({}), s).await
+        }
+        .await;
+        if started.is_err() {
+            let covering = {
+                let mut state = page.devtools.lock().expect("devtools lock");
+                state.profile = None;
+                state.coverage.is_some()
+            };
+            if !covering {
+                page.cdp.send("Profiler.disable", json!({}), s).await.ok();
+            }
+        }
+        started
+    })
+    .await
 }
 
 async fn profile_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) -> Result<()> {
@@ -313,11 +345,11 @@ async fn profile_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) ->
         bail!("no CPU profile is recording on this tab; `hba perf profile start` begins one");
     }
     let path = output_path(cx, path, "profile", "cpuprofile")?;
-    // Stopping the profile is final, so the file is opened first.
-    let file = output::create(&path)?;
+    // Stopping the profile is final, so the file is opened first. Profiles hold script URLs.
+    let file = output::create_private(&path).with_context(|| format!("creating {}", path.display()))?;
     let (page, saved_to) = (Arc::clone(page), path.clone());
     // Its own task, so a client that hangs up still gets the profile saved and the Profiler off.
-    let raw = tokio::spawn(async move {
+    let raw = to_completion(async move {
         let session = page
             .devtools
             .lock()
@@ -339,7 +371,7 @@ async fn profile_stop(cx: &mut Cx<'_>, page: &Arc<Page>, path: Option<&Path>) ->
         written.await.with_context(|| format!("writing {}", saved_to.display()))?;
         anyhow::Ok(raw)
     })
-    .await??;
+    .await?;
     let profile: Profile = serde_json::from_str(raw.get()).context("reading the CPU profile")?;
     let summary = Summary::of(&profile);
     cx.say(format!(
@@ -567,6 +599,52 @@ fn node_count(head: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page::tests::{attached_page, eventually, sessions_of, steer};
+
+    #[tokio::test]
+    async fn a_trace_stream_nobody_waits_for_is_closed() {
+        let (_page, cdp, received) = attached_page().await;
+        // What a trace whose `stop` gave up sends later, with no trace recorded any more.
+        let complete = json!({"method": "Tracing.tracingComplete", "sessionId": "page", "params": {"stream": "7"}});
+        steer(&cdp, "Test.emit", complete).await;
+        assert!(eventually(|| sessions_of(&received, "IO.close") == ["page"]).await, "the stream stayed open");
+        let handles: Vec<serde_json::Value> = received
+            .lock()
+            .expect("log lock")
+            .iter()
+            .filter(|command| command["method"] == "IO.close")
+            .map(|command| command["params"]["handle"].clone())
+            .collect();
+        assert_eq!(handles, [json!("7")]);
+    }
+
+    #[tokio::test]
+    async fn a_trace_is_recorded_before_it_starts_and_forgotten_when_refused() {
+        let (page, cdp, _) = attached_page().await;
+        let tracing = || page.devtools.lock().expect("devtools lock").trace.is_some();
+        let refused = json!({"method": "Tracing.start", "message": "Tracing has already been started"});
+        steer(&cdp, "Test.fail", refused).await;
+        begin_trace(&page).await.expect_err("the browser refuses the trace");
+        assert!(!tracing(), "a refused trace is forgotten");
+        steer(&cdp, "Test.pass", json!({"method": "Tracing.start"})).await;
+
+        // Cancelled before the browser answers, as the daemon cancels a command whose client hung up.
+        steer(&cdp, "Test.hold", json!({"method": "Tracing.start"})).await;
+        let start = begin_trace(&page);
+        assert!(tokio::time::timeout(Duration::from_millis(50), start).await.is_err(), "the start ended early");
+        assert!(tracing(), "the trace the browser is starting is recorded, so `stop` finds it");
+    }
+
+    #[tokio::test]
+    async fn a_refused_profile_turns_the_profiler_off_again() {
+        let (page, cdp, received) = attached_page().await;
+        let refused = json!({"method": "Profiler.setSamplingInterval", "message": "Cannot change sampling interval when profiling."});
+        steer(&cdp, "Test.fail", refused).await;
+        begin_profile(&page).await.expect_err("the browser refuses the interval");
+        assert!(!page.devtools.lock().expect("devtools lock").profiling(), "a refused profile is forgotten");
+        assert_eq!(sessions_of(&received, "Profiler.enable"), ["page"]);
+        assert_eq!(sessions_of(&received, "Profiler.disable"), ["page"], "the Profiler stayed on");
+    }
 
     fn profile() -> Profile {
         serde_json::from_value(json!({

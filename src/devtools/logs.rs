@@ -1,20 +1,17 @@
 //! `hba console` and `hba errors`: what the page logged and what broke.
 
-use std::fmt::Write as _;
 use std::time::Instant;
 
 use anyhow::Result;
 use serde_json::Value;
 
 use super::net::request_json;
+use super::{BUDGET, note_earlier, tail};
 use crate::cli::{ConsoleArgs, ErrorsArgs};
 use crate::console::{Capture, Entry, Level};
 use crate::daemon::Cx;
 use crate::output;
 use crate::page::Page;
-
-/// Characters printed before the rest of a listing goes to a file.
-const BUDGET: usize = 32_000;
 
 /// `hba console`: captured messages, newest last; `--on`/`--off` change capture, `--clear` forgets.
 pub async fn console(cx: &mut Cx<'_>, args: ConsoleArgs) -> Result<()> {
@@ -51,8 +48,7 @@ pub async fn console(cx: &mut Cx<'_>, args: ConsoleArgs) -> Result<()> {
     let (lines, json, earlier) = {
         let log = page.console.lock().expect("console lock");
         let matching: Vec<&Entry> = log.entries.iter().filter(|entry| entry.level >= min).collect();
-        let earlier = matching.len().saturating_sub(args.last);
-        let shown = &matching[earlier..];
+        let (earlier, shown) = tail(&matching, args.last);
         let json: Vec<Value> = if cx.json { shown.iter().map(|entry| entry.json()).collect() } else { Vec::new() };
         (shown.iter().map(|entry| entry.line()).collect::<Vec<String>>(), json, earlier)
     };
@@ -61,9 +57,7 @@ pub async fn console(cx: &mut Cx<'_>, args: ConsoleArgs) -> Result<()> {
         return Ok(());
     }
     let mut text = String::new();
-    if earlier > 0 {
-        let _ = writeln!(text, "… {} (raise -n)", output::count(earlier, "earlier message"));
-    }
+    note_earlier(&mut text, earlier, "earlier message");
     for line in &lines {
         text.push_str(line);
         text.push('\n');
@@ -107,17 +101,14 @@ pub async fn errors(cx: &mut Cx<'_>, args: ErrorsArgs) -> Result<()> {
         }
     }
     items.sort_by_key(|(at, ..)| *at);
-    let earlier = items.len().saturating_sub(args.last);
-    let shown = &items[earlier..];
+    let (earlier, shown) = tail(&items, args.last);
     if with_json {
         let json: Vec<&Value> = shown.iter().map(|(_, _, json)| json).collect();
         cx.say(serde_json::to_string(&json)?);
         return Ok(());
     }
     let mut text = String::new();
-    if earlier > 0 {
-        let _ = writeln!(text, "… {} (raise -n)", output::count(earlier, "earlier error"));
-    }
+    note_earlier(&mut text, earlier, "earlier error");
     for (_, line, _) in shown {
         text.push_str(line);
         text.push('\n');

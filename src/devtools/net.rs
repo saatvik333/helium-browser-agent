@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::har::{self, Phases};
+use super::{BUDGET, file_goes_with_stop, note_earlier, output_path, tail};
 use crate::cli::{NetArgs, NetOp, StartStop};
 use crate::daemon::Cx;
 use crate::network::Request;
@@ -40,9 +41,6 @@ const KINDS: [&str; 18] = [
     "preflight",
     "other",
 ];
-
-/// Characters printed before the rest of a listing goes to a file.
-const BUDGET: usize = 32_000;
 
 /// Largest response body a HAR file includes.
 const HAR_BODY_LIMIT: usize = 1 << 20;
@@ -130,8 +128,7 @@ fn list(cx: &mut Cx<'_>, page: &Page, filter: &Filter, last: usize) -> Result<()
     let (lines, json, earlier, total) = {
         let log = page.network.lock().expect("network lock");
         let matching: Vec<&Request> = log.iter().filter(|request| filter.accepts(request)).collect();
-        let earlier = matching.len().saturating_sub(last);
-        let shown = &matching[earlier..];
+        let (earlier, shown) = tail(&matching, last);
         let json: Vec<Value> =
             if cx.json { shown.iter().map(|request| request_json(request)).collect() } else { Vec::new() };
         (shown.iter().map(|request| request.summary()).collect::<Vec<String>>(), json, earlier, log.iter().count())
@@ -144,9 +141,7 @@ fn list(cx: &mut Cx<'_>, page: &Page, filter: &Filter, last: usize) -> Result<()
     for rule in &rules {
         let _ = writeln!(text, "{rule}");
     }
-    if earlier > 0 {
-        let _ = writeln!(text, "… {} (raise -n)", output::count(earlier, "earlier request"));
-    }
+    note_earlier(&mut text, earlier, "earlier request");
     for line in &lines {
         let _ = writeln!(text, "{line}");
     }
@@ -332,8 +327,11 @@ async fn body(cx: &mut Cx<'_>, page: &Page, id: &str, output: Option<&Path>, max
     let mime = request.mime.as_deref().unwrap_or("unknown type");
     if let Some(output) = output {
         let path = cx.path(output);
-        output::write_private(&path, &bytes)?;
-        cx.say(format!("saved {} ({mime}, {})", path.display(), output::bytes(bytes.len() as u64)));
+        let size = bytes.len() as u64;
+        let saved_to = path.clone();
+        // Bodies run to megabytes; the write stays off the runtime thread.
+        tokio::task::spawn_blocking(move || output::write_private(&saved_to, &bytes)).await??;
+        cx.say(format!("saved {} ({mime}, {})", path.display(), output::bytes(size)));
         return Ok(());
     }
     let size = bytes.len() as u64;
@@ -516,9 +514,7 @@ async fn unroute(cx: &mut Cx<'_>, page: &Page, pattern: Option<&str>) -> Result<
 }
 
 fn har_start(cx: &mut Cx<'_>, page: &Page, path: Option<&Path>) -> Result<()> {
-    if let Some(path) = path {
-        bail!("the file goes with stop: `hba net har stop {}`", path.display());
-    }
+    file_goes_with_stop("net har stop", path)?;
     if !page.network.lock().expect("network lock").start_har() {
         bail!("a HAR recording is already running; `hba net har stop FILE` saves it");
     }
@@ -533,10 +529,7 @@ async fn har_stop(cx: &mut Cx<'_>, page: &Page, path: Option<&Path>) -> Result<(
         .expect("network lock")
         .har_recording()
         .context("no HAR recording is running; `hba net har start` begins one")?;
-    let path = match path {
-        Some(path) => cx.path(path),
-        None => cx.artifact("network", "har")?,
-    };
+    let path = output_path(cx, path, "network", "har")?;
     // Bodies come from the page's renderer; a busy page answers slowly, so they get the
     // command's time and the file is saved with what arrived.
     let deadline = Instant::now() + cx.timeout;
@@ -560,30 +553,59 @@ async fn har_stop(cx: &mut Cx<'_>, page: &Page, path: Option<&Path>) -> Result<(
             }
         }
     }
-    let document = har::build(&recording.requests, &bodies, env!("CARGO_PKG_VERSION"));
-    let bytes = serde_json::to_vec(&document)?;
-    output::write_private(&path, &bytes)?;
+    let requests = recording.requests.len();
+    let with_bodies = bodies.iter().flatten().count();
+    let document = har::build(&recording.requests, bodies, env!("CARGO_PKG_VERSION"));
+    // A HAR file runs to tens of megabytes: it is streamed into the file off the runtime thread.
+    let saved_to = path.clone();
+    let size = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut out = std::io::BufWriter::new(output::create_private(&saved_to)?);
+        serde_json::to_writer(&mut out, &document)?;
+        let file = out.into_inner().map_err(std::io::IntoInnerError::into_error)?;
+        Ok(file.metadata()?.len())
+    })
+    .await?
+    .with_context(|| format!("writing {}", path.display()))?;
     // Ended only once saved: a failed write or a hang-up keeps it for another `stop`.
     page.network.lock().expect("network lock").stop_har();
-    let with_bodies = bodies.iter().filter(|body| body.is_some()).count();
-    cx.say(format!(
-        "saved {} ({} requests, {with_bodies} with bodies, {})",
+    cx.say(har_report(&path, requests, with_bodies, size, recording.dropped, missed, cx.timeout));
+    Ok(())
+}
+
+/// What `hba net har stop` says after saving `path` (`size` bytes): requests saved and with
+/// bodies, recorded requests that had left the log, and bodies left out for lack of time.
+fn har_report(
+    path: &Path,
+    requests: usize,
+    with_bodies: usize,
+    size: u64,
+    dropped: u64,
+    missed: usize,
+    timeout: Duration,
+) -> String {
+    let mut text = format!(
+        "saved {} ({}, {with_bodies} with bodies, {})",
         path.display(),
-        recording.requests.len(),
-        output::bytes(bytes.len() as u64)
-    ));
-    if recording.dropped > 0 {
-        cx.say(format!("{} recorded requests had left the log (it keeps the latest 1000)", recording.dropped));
+        output::count(requests, "request"),
+        output::bytes(size)
+    );
+    if dropped > 0 {
+        let _ = write!(
+            text,
+            "\n{} had left the log (it keeps the latest 1000)",
+            output::count(dropped as usize, "recorded request")
+        );
     }
     if missed > 0 {
-        cx.say(format!(
-            "{missed} response {} left out: the page did not hand {} over within {:.0}s (raise --timeout)",
+        let _ = write!(
+            text,
+            "\n{missed} response {} left out: the page did not hand {} over within {:.0}s (raise --timeout)",
             if missed == 1 { "body is" } else { "bodies are" },
             if missed == 1 { "it" } else { "them" },
-            cx.timeout.as_secs_f32()
-        ));
+            timeout.as_secs_f32()
+        );
     }
-    Ok(())
+    text
 }
 
 /// Whether a HAR file includes the response body: text of a finished response up to
@@ -679,6 +701,20 @@ mod tests {
         assert!(filter.accepts(&request));
         request.kind = "Script".into();
         assert!(!filter.accepts(&request));
+    }
+
+    #[test]
+    fn har_reports_count_in_words() {
+        let path = Path::new("/tmp/a.har");
+        let one = har_report(path, 1, 0, 2048, 1, 1, Duration::from_secs(10));
+        assert_eq!(
+            one,
+            "saved /tmp/a.har (1 request, 0 with bodies, 2.0 KB)\n\
+             1 recorded request had left the log (it keeps the latest 1000)\n\
+             1 response body is left out: the page did not hand it over within 10s (raise --timeout)"
+        );
+        let many = har_report(path, 3, 2, 10, 0, 0, Duration::from_secs(10));
+        assert_eq!(many, "saved /tmp/a.har (3 requests, 2 with bodies, 10 B)");
     }
 
     fn sample() -> Request {

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
+use super::to_completion;
 use crate::cdp::Event;
 use crate::daemon::Cx;
 use crate::output;
@@ -81,7 +82,7 @@ pub(super) async fn start(cx: &mut Cx<'_>, page: &Arc<Page>) -> Result<()> {
     // Its own task, so a client that hangs up leaves coverage either running and recorded or off.
     let page = Arc::clone(page);
     let tab = page.tab.clone();
-    tokio::spawn(async move {
+    to_completion(async move {
         let s = Some(&*session);
         let js = async {
             page.cdp.send("Profiler.enable", json!({}), s).await?;
@@ -100,7 +101,7 @@ pub(super) async fn start(cx: &mut Cx<'_>, page: &Arc<Page>) -> Result<()> {
         }
         started
     })
-    .await?
+    .await
     .context("starting coverage")?;
     cx.say(format!(
         "collecting JS and CSS coverage on {}; `hba reload` covers page load, `hba perf coverage stop` reports",
@@ -145,7 +146,7 @@ pub(super) async fn stop(cx: &mut Cx<'_>, page: &Arc<Page>, output: Option<&Path
     // Its own task, so a client that hangs up still gets the coverage saved and Profiler, CSS and
     // DOM turned off.
     let page = Arc::clone(page);
-    let (sheets, js, css) = tokio::spawn(async move {
+    let (sheets, js, css) = to_completion(async move {
         let run = page.devtools.lock().expect("devtools lock").coverage.take().context("coverage was stopped")?;
         let s = Some(&*run.session);
         let (js, css) = tokio::join!(
@@ -154,18 +155,21 @@ pub(super) async fn stop(cx: &mut Cx<'_>, page: &Arc<Page>, output: Option<&Path
         );
         finish(&page, &run.session).await;
         let (js, css) = (js.context("reading JavaScript coverage")?, css.context("reading CSS coverage")?);
-        if let Some((path, file)) = file {
-            save(file, &js, &css, &run.sheets).with_context(|| format!("writing {}", path.display()))?;
-        }
-        anyhow::Ok((run.sheets, js, css))
+        let sheets = run.sheets;
+        let Some((path, file)) = file else {
+            return Ok((sheets, js, css));
+        };
+        // Coverage of a large app runs to megabytes; the write stays off the runtime thread.
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            save(file, &js, &css, &sheets).with_context(|| format!("writing {}", path.display()))?;
+            Ok((sheets, js, css))
+        })
+        .await?
     })
-    .await??;
+    .await?;
     let scripts: JsCoverage = serde_json::from_str(js.get()).context("decoding JavaScript coverage")?;
     let rules: CssCoverage = serde_json::from_str(css.get()).context("decoding CSS coverage")?;
     let rows = summarize(&scripts.result, &rules.rule_usage, &sheets);
-    if let Some(path) = saved {
-        cx.say(format!("saved {}", path.display()));
-    }
     if cx.json {
         let json: Vec<Value> = rows
             .iter()
@@ -173,6 +177,9 @@ pub(super) async fn stop(cx: &mut Cx<'_>, page: &Arc<Page>, output: Option<&Path
             .collect();
         cx.say(serde_json::to_string(&json)?);
         return Ok(());
+    }
+    if let Some(path) = saved {
+        cx.say(format!("saved {}", path.display()));
     }
     cx.say(table(&rows));
     Ok(())

@@ -173,7 +173,8 @@ impl Drop for Rig {
 }
 
 /// Minimal fixture server (GET only): files, plus `/no-content` (204), `/redirect?to=URL` (302),
-/// `/attachment/FILE` (the file as a download) and `/slow/FILE` (the file after 300 ms).
+/// `/set-cookie` (sets `hba_har=fixture`), `/attachment/FILE` (the file as a download) and
+/// `/slow/FILE` (the file after 300 ms).
 fn serve(dir: PathBuf) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
     let address = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
@@ -199,6 +200,9 @@ fn respond(mut stream: TcpStream, dir: &Path) {
     } else if let Some(to) = query.strip_prefix("to=").filter(|_| path == "/redirect") {
         headers = format!("Location: {to}\r\n");
         ("302 Found", Vec::new(), "text/plain")
+    } else if path == "/set-cookie" {
+        headers = "Set-Cookie: hba_har=fixture; Path=/; HttpOnly\r\n".to_owned();
+        ("200 OK", b"cookie set".to_vec(), "text/plain")
     } else {
         let name = if let Some(name) = path.strip_prefix("/attachment/") {
             headers = format!("Content-Disposition: attachment; filename=\"{name}\"\r\n");
@@ -708,6 +712,18 @@ fn extension_pages_let_go_of_websites(rig: &Rig) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension");
     let loaded = rig.ok(s, &["ext", "load", dir.to_str().expect("utf-8 path")]);
     let id = extension_id(&loaded);
+    // Clearing a console that was never captured starts no capture.
+    let cleared = rig.ok(s, &["ext", "logs", &id, "--clear"]);
+    assert_eq!(cleared.trim(), "cleared 0 messages of hba test extension");
+    let listed = rig.ok(s, &["ext"]);
+    assert!(listed.contains(&id) && !listed.contains("logs captured"), "{listed}");
+    // A one-off eval lets go of the worker afterwards.
+    assert_eq!(rig.ok(s, &["ext", "eval", &id, "1 + 1"]).trim(), "2");
+    let worker = rig.ok(s, &["ext", "sw", &id]);
+    assert!(worker.contains("is running") && !worker.contains("hba is attached"), "{worker}");
+    let status: serde_json::Value =
+        serde_json::from_str(&rig.ok(s, &["--json", "ext", "sw", &id])).expect("ext sw --json is JSON");
+    assert_eq!((&status["attached"], &status["logs"]), (&false.into(), &false.into()), "{status}");
     rig.ok(s, &["ext", "open", &id, "options.html"]);
     let capturing = rig.ok(s, &["ext", "logs", &id]);
     assert!(capturing.contains("1 page"), "{capturing}");
@@ -963,14 +979,18 @@ fn network_log_bodies_blocking_and_har(rig: &Rig) {
     rig.ok(s, &["open", &rig.url("devtools-net.html")]);
     until(rig, s, &["text", "#out"], "real data from the server");
     rig.ok(s, &["net", "har", "start"]);
+    rig.ok(s, &["click", "#cookie"]);
+    until(rig, s, &["text", "#cookied"], "cookie set");
     rig.ok(s, &["click", "#load"]);
     rig.ok(s, &["click", "#post"]);
     until(rig, s, &["text", "#posted"], "posted 200");
     let fetched = rig.ok(s, &["net", "--type", "fetch", "--filter", "devtools-data.json"]);
-    let line = fetched.lines().find(|line| line.contains("GET")).unwrap_or_else(|| panic!("no GET in:\n{fetched}"));
+    let line = fetched.lines().rfind(|line| line.contains("GET")).unwrap_or_else(|| panic!("no GET in:\n{fetched}"));
     let id = line.trim_start_matches('#').split_whitespace().next().expect("request number").to_owned();
     let shown = rig.ok(s, &["net", "show", &id]);
     assert!(shown.contains("GET") && shown.contains("application/json"), "{shown}");
+    // The cookie the browser sent is reduced to its shape.
+    assert!(shown.contains("cookie: hba_har=…(7 chars)") && !shown.contains("fixture"), "{shown}");
     assert!(rig.ok(s, &["net", "body", &id]).contains("real data from the server"));
     let saved = rig.ok(s, &["net", "har", "stop", har.to_str().expect("utf-8 path")]);
     assert!(saved.contains("saved"), "{saved}");
@@ -982,6 +1002,20 @@ fn network_log_bodies_blocking_and_har(rig: &Rig) {
         .map(|e| e["request"]["method"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert!(methods.contains(&"GET".to_owned()) && methods.contains(&"POST".to_owned()), "{methods:?}");
+    let cookie = |side: &str, part: &str| {
+        entries
+            .iter()
+            .filter(|e| e["request"]["url"].as_str().is_some_and(|u| u.contains(part)))
+            .flat_map(|e| e[side]["cookies"].as_array().cloned().unwrap_or_default())
+            .find(|cookie| cookie["name"] == "hba_har")
+    };
+    let stored = cookie("response", "/set-cookie").unwrap_or_else(|| panic!("no Set-Cookie in the HAR: {entries:?}"));
+    assert_eq!(
+        (&stored["value"], &stored["path"], &stored["httpOnly"]),
+        (&"fixture".into(), &"/".into(), &true.into())
+    );
+    let sent = cookie("request", "devtools-data.json").expect("the cookie was sent and recorded");
+    assert_eq!(sent["value"], "fixture");
     // A blocked request fails in the page; removing the rule restores it.
     rig.ok(s, &["net", "block", "*devtools-data.json*"]);
     rig.ok(s, &["click", "#load"]);
@@ -1003,6 +1037,13 @@ fn performance_reports(rig: &Rig) {
     rig.ok(s, &["reload"]);
     let coverage = rig.ok(s, &["perf", "coverage", "stop"]);
     assert!(coverage.contains("devtools-perf.js") && coverage.contains("devtools-perf.css"), "{coverage}");
+    let saved = artifact("coverage.json");
+    rig.ok(s, &["perf", "coverage", "start"]);
+    rig.ok(s, &["reload"]);
+    let printed = rig.ok(s, &["--json", "perf", "coverage", "stop", "-o", saved.to_str().expect("utf-8 path")]);
+    let rows: serde_json::Value = serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {printed}"));
+    assert!(rows.as_array().is_some_and(|rows| !rows.is_empty()), "{printed}");
+    assert!(fs::metadata(&saved).is_ok_and(|m| m.len() > 0), "coverage file not written");
     let trace = artifact("trace.json");
     rig.ok(s, &["perf", "trace", "start"]);
     rig.ok(s, &["click", "#work"]);

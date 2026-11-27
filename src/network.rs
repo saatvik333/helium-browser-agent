@@ -18,6 +18,9 @@ use crate::page::Page;
 /// Requests kept per tab.
 const CAPACITY: usize = 1000;
 
+/// Hops of a redirect chain: Chromium follows at most 20 redirects.
+const MAX_HOPS: usize = 21;
+
 /// Requests in flight longer than this are treated as long-polling and ignored for settling.
 const LONG_POLL: Duration = Duration::from_secs(8);
 
@@ -36,6 +39,8 @@ pub struct Request {
     pub kind: String,
     /// What started the request, e.g. `script app.js:34`.
     pub initiator: String,
+    /// As sent on the wire (cookies included) once `Network.requestWillBeSentExtraInfo` came,
+    /// else as the page asked for them.
     pub headers: Value,
     pub post_data: Option<String>,
     pub status: Option<u16>,
@@ -45,7 +50,9 @@ pub struct Request {
     /// Server address as `ip:port`.
     pub remote: Option<String>,
     pub mime: Option<String>,
+    /// As received on the wire once `Network.responseReceivedExtraInfo` came (`raw_response`).
     pub response_headers: Value,
+    pub raw_response: bool,
     pub timing: Option<Timing>,
     pub failure: Option<String>,
     pub from_cache: bool,
@@ -109,11 +116,28 @@ pub struct Recording {
     pub dropped: u64,
 }
 
+/// Redirect hops sharing one protocol request id, and its `*ExtraInfo` events, which arrive
+/// before or after the hop's own events: the nth of each kind belongs to the nth hop.
+#[derive(Debug, Default)]
+struct Chain {
+    /// Short ids of the hops seen, oldest first.
+    hops: Vec<u64>,
+    request_infos: usize,
+    response_infos: usize,
+    /// Headers of `*ExtraInfo` events that came before their hop, oldest first.
+    early_requests: VecDeque<Value>,
+    early_responses: VecDeque<Value>,
+}
+
 /// The tab's requests (latest [`CAPACITY`]) and its failures.
 #[derive(Debug, Default)]
 pub struct Log {
     requests: VecDeque<Request>,
-    by_request: HashMap<String, u64>,
+    /// By protocol request id; the chains of requests still in the log, and up to [`CAPACITY`]
+    /// chains known only from `*ExtraInfo` events (`orphans`).
+    chains: HashMap<String, Chain>,
+    /// Request ids whose chain an `*ExtraInfo` event started, oldest first.
+    orphans: VecDeque<String>,
     next_id: u64,
     /// Sequence of finished-with-problem events, for action reports.
     seq: u64,
@@ -131,7 +155,8 @@ impl Log {
     /// Forgets every request and failure; ids keep counting up.
     pub fn clear(&mut self) {
         self.requests.clear();
-        self.by_request.clear();
+        self.chains.clear();
+        self.orphans.clear();
         self.problems.clear();
     }
 
@@ -150,20 +175,71 @@ impl Log {
         usize::try_from(id.checked_sub(first)?).ok()
     }
 
-    fn entry(&mut self, network_id: &str) -> Option<&mut Request> {
-        let index = self.index(*self.by_request.get(network_id)?)?;
+    fn get_mut(&mut self, id: u64) -> Option<&mut Request> {
+        let index = self.index(id)?;
         self.requests.get_mut(index)
     }
 
-    fn push(&mut self, request: Request) {
+    /// The latest hop of request `network_id`.
+    fn entry(&mut self, network_id: &str) -> Option<&mut Request> {
+        let id = *self.chains.get(network_id)?.hops.last()?;
+        self.get_mut(id)
+    }
+
+    fn push(&mut self, mut request: Request) {
         if self.requests.len() == CAPACITY
             && let Some(old) = self.requests.pop_front()
-            && self.by_request.get(&old.network_id) == Some(&old.id)
+            && self.chains.get(&old.network_id).and_then(|chain| chain.hops.last()) == Some(&old.id)
         {
-            self.by_request.remove(&old.network_id);
+            self.chains.remove(&old.network_id);
         }
-        self.by_request.insert(request.network_id.clone(), request.id);
+        let chain = self.chains.entry(request.network_id.clone()).or_default();
+        chain.hops.push(request.id);
+        if let Some(headers) = chain.early_requests.pop_front() {
+            request.headers = headers;
+        }
+        if let Some(headers) = chain.early_responses.pop_front() {
+            request.response_headers = headers;
+            request.raw_response = true;
+        }
         self.requests.push_back(request);
+    }
+
+    /// Wire headers of a hop's request, or of its `response`, from an `*ExtraInfo` event; kept
+    /// for the hop when it has not been seen yet.
+    fn extra_info(&mut self, network_id: &str, headers: Value, response: bool) {
+        if !self.chains.contains_key(network_id) {
+            self.orphans.push_back(network_id.to_owned());
+            if self.orphans.len() > CAPACITY
+                && let Some(old) = self.orphans.pop_front()
+                && self.chains.get(&old).is_some_and(|chain| chain.hops.is_empty())
+            {
+                self.chains.remove(&old);
+            }
+            self.chains.insert(network_id.to_owned(), Chain::default());
+        }
+        let Some(chain) = self.chains.get_mut(network_id) else { return };
+        let (seen, early) = if response {
+            (&mut chain.response_infos, &mut chain.early_responses)
+        } else {
+            (&mut chain.request_infos, &mut chain.early_requests)
+        };
+        let hop = *seen;
+        *seen += 1;
+        let Some(&id) = chain.hops.get(hop) else {
+            if early.len() < MAX_HOPS {
+                early.push_back(headers);
+            }
+            return;
+        };
+        if let Some(request) = self.get_mut(id) {
+            if response {
+                request.response_headers = headers;
+                request.raw_response = true;
+            } else {
+                request.headers = headers;
+            }
+        }
     }
 
     /// True while document, fetch or XHR requests that started at or after `since` are
@@ -289,7 +365,9 @@ impl Request {
             None => ip,
         });
         self.from_cache |= response.from_disk_cache || response.from_prefetch_cache || response.from_service_worker;
-        self.response_headers = response.headers;
+        if !self.raw_response {
+            self.response_headers = response.headers;
+        }
         self.timing = response.timing;
     }
 }
@@ -343,6 +421,18 @@ pub fn on_event(page: &Page, event: &Event) {
         }
         "Network.loadingFinished" => loading_finished(page, event),
         "Network.loadingFailed" => loading_failed(page, event),
+        "Network.requestWillBeSentExtraInfo" | "Network.responseReceivedExtraInfo" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ExtraInfo {
+                request_id: String,
+                headers: Value,
+            }
+            if let Ok(info) = event.parse::<ExtraInfo>() {
+                let response = event.method == "Network.responseReceivedExtraInfo";
+                page.network.lock().expect("network lock").extra_info(&info.request_id, info.headers, response);
+            }
+        }
         _ => crate::routes::on_event(page, event),
     }
 }
@@ -420,6 +510,7 @@ fn will_be_sent(page: &Page, event: &Event) {
         remote: None,
         mime: None,
         response_headers: Value::Null,
+        raw_response: false,
         timing: None,
         failure: None,
         from_cache: false,
@@ -617,6 +708,7 @@ mod tests {
             remote: None,
             mime: None,
             response_headers: Value::Null,
+            raw_response: false,
             timing: None,
             failure: None,
             from_cache: false,
@@ -745,5 +837,65 @@ mod tests {
         assert_eq!(parser.describe(), "parser x.test:5");
         let other: Initiator = serde_json::from_value(serde_json::json!({"type": "other"})).expect("initiator");
         assert_eq!(other.describe(), "other");
+    }
+
+    fn response(headers: &Value) -> Response {
+        serde_json::from_value(serde_json::json!({"status": 200, "headers": headers})).expect("response")
+    }
+
+    #[test]
+    fn extra_info_after_the_hop_replaces_its_headers() {
+        let mut log = Log::default();
+        push(&mut log, "r");
+        let hop = log.entry("r").expect("pushed");
+        hop.headers = serde_json::json!({"Accept": "*/*"});
+        hop.record(response(&serde_json::json!({"content-type": "text/plain"})));
+        log.extra_info("r", serde_json::json!({"Accept": "*/*", "Cookie": "a=1"}), false);
+        log.extra_info("r", serde_json::json!({"Content-Type": "text/plain", "Set-Cookie": "a=1"}), true);
+        let hop = log.entry("r").expect("pushed");
+        assert_eq!(hop.headers["Cookie"], "a=1");
+        assert_eq!(hop.response_headers["Set-Cookie"], "a=1");
+        assert!(log.orphans.is_empty());
+    }
+
+    #[test]
+    fn extra_info_before_the_hop_waits_for_it() {
+        let mut log = Log::default();
+        log.extra_info("e", serde_json::json!({"Cookie": "a=1"}), false);
+        log.extra_info("e", serde_json::json!({"Set-Cookie": "a=1"}), true);
+        push(&mut log, "e");
+        let hop = log.entry("e").expect("pushed");
+        assert_eq!(hop.headers["Cookie"], "a=1");
+        hop.record(response(&serde_json::json!({"content-type": "text/plain"})));
+        assert_eq!(hop.response_headers, serde_json::json!({"Set-Cookie": "a=1"}), "the wire headers stay");
+    }
+
+    #[test]
+    fn extra_info_goes_to_its_hop_of_a_redirect_chain() {
+        let mut log = Log::default();
+        let first = push(&mut log, "c");
+        log.extra_info("c", serde_json::json!({"hop": "1"}), false);
+        log.extra_info("c", serde_json::json!({"hop": "1", "status": "302"}), true);
+        // The second hop's request goes out before hba hears of the hop.
+        log.extra_info("c", serde_json::json!({"hop": "2"}), false);
+        let second = push(&mut log, "c");
+        log.extra_info("c", serde_json::json!({"hop": "2", "status": "200"}), true);
+        let hop = |log: &Log, id| log.get(id).map(|r| (r.headers["hop"].clone(), r.response_headers["status"].clone()));
+        assert_eq!(hop(&log, first), Some((Value::from("1"), Value::from("302"))));
+        assert_eq!(hop(&log, second), Some((Value::from("2"), Value::from("200"))));
+    }
+
+    #[test]
+    fn extra_info_without_requests_is_bounded() {
+        let mut log = Log::default();
+        for n in 0..CAPACITY + 5 {
+            log.extra_info(&format!("x{n}"), Value::Null, false);
+        }
+        for _ in 0..MAX_HOPS + 5 {
+            log.extra_info("busy", Value::Null, true);
+        }
+        assert_eq!(log.chains.len(), CAPACITY);
+        assert_eq!(log.chains.get("busy").map(|chain| chain.early_responses.len()), Some(MAX_HOPS));
+        assert!(!log.chains.contains_key("x5"));
     }
 }

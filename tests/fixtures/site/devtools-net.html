@@ -7,6 +7,8 @@
 <button id="load" onclick="loadData()">Load data</button>
 <button id="post" onclick="postData()">Post</button>
 <p id="posted"></p>
+<button id="cookie" onclick="setCookie()">Set cookie</button>
+<p id="cookied"></p>
 <script>
 function loadData() {
   fetch('/devtools-data.json?v=' + Date.now())
@@ -17,6 +19,11 @@ function loadData() {
 function postData() {
   fetch('/devtools-data.json', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({hello: 'world'})})
     .then((response) => { document.getElementById('posted').textContent = 'posted ' + response.status; });
+}
+function setCookie() {
+  fetch('/set-cookie')
+    .then((response) => response.text())
+    .then((text) => { document.getElementById('cookied').textContent = text; });
 }
 loadData();
 </script>

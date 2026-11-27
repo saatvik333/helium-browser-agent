@@ -109,7 +109,7 @@ fn entry(request: &Request, body: Option<Body>) -> Value {
         "method": request.method,
         "url": request.url,
         "httpVersion": http_version,
-        "cookies": [],
+        "cookies": request_cookies(&request.headers),
         "headers": headers(&request.headers),
         "queryString": query_string(&request.url),
         "headersSize": -1,
@@ -134,7 +134,7 @@ fn entry(request: &Request, body: Option<Body>) -> Value {
         "status": request.status.unwrap_or(0),
         "statusText": request.status_text,
         "httpVersion": http_version,
-        "cookies": [],
+        "cookies": response_cookies(&request.response_headers, request.wall_time),
         "headers": headers(&request.response_headers),
         "content": content,
         "redirectURL": header(&request.response_headers, "location").unwrap_or_default(),
@@ -193,6 +193,134 @@ fn headers(headers: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The `Cookie` header as HAR cookies; a pair without `=` is a cookie without a name.
+fn request_cookies(headers: &Value) -> Vec<Value> {
+    let Some(cookies) = header(headers, "cookie") else {
+        return Vec::new();
+    };
+    cookies
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or(("", pair));
+            json!({"name": name.trim(), "value": value.trim()})
+        })
+        .collect()
+}
+
+/// The `Set-Cookie` lines as HAR cookies. `Max-Age` counts from `now` (seconds since the epoch)
+/// and wins over `Expires`, as in browsers.
+fn response_cookies(headers: &Value, now: f64) -> Vec<Value> {
+    let Some(lines) = header(headers, "set-cookie") else {
+        return Vec::new();
+    };
+    lines.split('\n').filter_map(|line| set_cookie(line, now)).collect()
+}
+
+fn set_cookie(line: &str, now: f64) -> Option<Value> {
+    let mut parts = line.split(';');
+    let pair = parts.next()?.trim();
+    if pair.is_empty() {
+        return None;
+    }
+    let (name, value) = pair.split_once('=').unwrap_or(("", pair));
+    let mut cookie = json!({"name": name.trim(), "value": value.trim(), "httpOnly": false, "secure": false});
+    let (mut expires, mut max_age) = (None, None);
+    for attribute in parts {
+        let (key, value) = attribute.split_once('=').unwrap_or((attribute, ""));
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("path") {
+            cookie["path"] = json!(value);
+        } else if key.eq_ignore_ascii_case("domain") {
+            cookie["domain"] = json!(value);
+        } else if key.eq_ignore_ascii_case("expires") {
+            expires = cookie_date(value);
+        } else if key.eq_ignore_ascii_case("max-age") {
+            max_age = value.parse::<i64>().ok().filter(|_| !value.starts_with('+'));
+        } else if key.eq_ignore_ascii_case("httponly") {
+            cookie["httpOnly"] = json!(true);
+        } else if key.eq_ignore_ascii_case("secure") {
+            cookie["secure"] = json!(true);
+        }
+    }
+    if let Some(at) = max_age.map(|seconds| now + seconds as f64).or(expires) {
+        cookie["expires"] = json!(iso8601(at));
+    }
+    Some(cookie)
+}
+
+/// A cookie date as seconds since the epoch, parsed as RFC 6265 §5.1.1 says: `Wed, 21 Oct 2015
+/// 07:28:00 GMT` and the older forms servers still send.
+fn cookie_date(text: &str) -> Option<f64> {
+    let delimiter = |c: char| matches!(c, '\t' | ' '..='/' | ';'..='@' | '['..='`' | '{'..='~');
+    let (mut time, mut day, mut month, mut year) = (None, None, None, None);
+    for token in text.split(delimiter).filter(|token| !token.is_empty()) {
+        if time.is_none()
+            && let Some(clock) = clock(token)
+        {
+            time = Some(clock);
+        } else if day.is_none()
+            && let Some((n, _)) = digits(token, 1, 2)
+        {
+            day = Some(n);
+        } else if month.is_none()
+            && let Some(n) = month_of(token)
+        {
+            month = Some(n);
+        } else if year.is_none()
+            && let Some((n, _)) = digits(token, 2, 4)
+        {
+            year = Some(match n {
+                70..=99 => n + 1900,
+                0..=69 => n + 2000,
+                _ => n,
+            });
+        }
+    }
+    let ((hour, minute, second), day, month, year) = (time?, day?, month?, year?);
+    if !(1..=31).contains(&day) || year < 1601 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), i64::from(month), i64::from(day));
+    Some((days * 86_400 + i64::from(hour * 3600 + minute * 60 + second)) as f64)
+}
+
+/// `hh:mm:ss` at the start of a token, one or two digits each.
+fn clock(token: &str) -> Option<(u32, u32, u32)> {
+    let (hour, rest) = digits(token, 1, 2)?;
+    let (minute, rest) = digits(rest.strip_prefix(':')?, 1, 2)?;
+    let (second, _) = digits(rest.strip_prefix(':')?, 1, 2)?;
+    Some((hour, minute, second))
+}
+
+/// The `min` to `max` digits a token starts with, as a number, and the rest of the token.
+fn digits(token: &str, min: usize, max: usize) -> Option<(u32, &str)> {
+    let end = token.find(|c: char| !c.is_ascii_digit()).unwrap_or(token.len());
+    if !(min..=max).contains(&end) {
+        return None;
+    }
+    Some((token[..end].parse().ok()?, &token[end..]))
+}
+
+/// 1 to 12 for a token starting with a month's English abbreviation.
+fn month_of(token: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let prefix = token.get(..3)?;
+    MONTHS.iter().position(|month| month.eq_ignore_ascii_case(prefix)).map(|index| index as u32 + 1)
+}
+
+/// Days from 1970-01-01 to a date of the proleptic Gregorian calendar, by Howard Hinnant's
+/// days-from-civil algorithm (the inverse of the one [`iso8601`] uses).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn query_string(url: &str) -> Vec<Value> {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let Some((_, query)) = without_fragment.split_once('?') else {
@@ -241,6 +369,7 @@ mod tests {
             remote: Some("[2001:db8::1]:443".to_owned()),
             mime: Some("application/json".to_owned()),
             response_headers: json!({"location": "/next", "set-cookie": "a=1\nb=2"}),
+            raw_response: true,
             timing: Some(Timing {
                 request_time: 100.010,
                 dns_start: 1.0,
@@ -305,6 +434,14 @@ mod tests {
         assert_eq!(entry["response"]["redirectURL"], "/next");
         assert_eq!(entry["response"]["headers"].as_array().map(Vec::len), Some(3), "set-cookie lines are split");
         assert_eq!(
+            entry["response"]["cookies"],
+            json!([
+                {"name": "a", "value": "1", "httpOnly": false, "secure": false},
+                {"name": "b", "value": "2", "httpOnly": false, "secure": false},
+            ])
+        );
+        assert_eq!(entry["request"]["cookies"], json!([]));
+        assert_eq!(
             entry["response"]["content"],
             json!({"size": 11, "mimeType": "application/json", "text": "eyJvayI6dHJ1ZX0=", "encoding": "base64"})
         );
@@ -322,6 +459,55 @@ mod tests {
         assert_eq!(body("YWI=", true).decoded_len(), 2);
         assert_eq!(body("YQ==", true).decoded_len(), 1);
         assert_eq!(body("héllo", false).decoded_len(), 6);
+    }
+
+    #[test]
+    fn cookies_are_parsed_from_their_headers() {
+        let cookies = request_cookies(&json!({"cookie": "sid=abc; theme = dark;flag;\nlast=x=y"}));
+        assert_eq!(
+            cookies,
+            [
+                json!({"name": "sid", "value": "abc"}),
+                json!({"name": "theme", "value": "dark"}),
+                json!({"name": "", "value": "flag"}),
+                json!({"name": "last", "value": "x=y"}),
+            ]
+        );
+        let headers = json!({"Set-Cookie": concat!(
+            "sid=abc; Path=/app; Domain=.api.test; Expires=Wed, 21 Oct 2015 07:28:00 GMT; HttpOnly; Secure; SameSite=Lax\n",
+            "short=1; max-age=60; expires=Thu, 01-Jan-1970 00:00:00 GMT\n",
+            "old=2; expires=Sunday, 06-Nov-94 08:49:37 GMT\n",
+            "bad=3; expires=someday\n",
+            "\n",
+        )});
+        assert_eq!(
+            response_cookies(&headers, 1_700_000_000.5),
+            [
+                json!({
+                    "name": "sid", "value": "abc", "path": "/app", "domain": ".api.test",
+                    "expires": "2015-10-21T07:28:00.000Z", "httpOnly": true, "secure": true,
+                }),
+                json!({
+                    "name": "short", "value": "1", "expires": "2023-11-14T22:14:20.500Z",
+                    "httpOnly": false, "secure": false,
+                }),
+                json!({
+                    "name": "old", "value": "2", "expires": "1994-11-06T08:49:37.000Z",
+                    "httpOnly": false, "secure": false,
+                }),
+                json!({"name": "bad", "value": "3", "httpOnly": false, "secure": false}),
+            ]
+        );
+    }
+
+    #[test]
+    fn cookie_dates_follow_rfc_6265() {
+        assert_eq!(cookie_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480.0));
+        assert_eq!(cookie_date("Thu Jan  1 00:00:00 1970"), Some(0.0));
+        assert_eq!(cookie_date("29-Feb-2024 12:00:00"), Some(1_709_208_000.0));
+        assert_eq!(cookie_date("01 Jan 1600 00:00:00"), None, "before 1601");
+        assert_eq!(cookie_date("32 Jan 2020 00:00:00"), None);
+        assert_eq!(cookie_date("01 Jan 2020"), None, "no time");
     }
 
     #[test]

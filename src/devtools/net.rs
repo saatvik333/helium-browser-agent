@@ -734,6 +734,7 @@ mod tests {
             remote: None,
             mime: None,
             response_headers: Value::Null,
+            raw_response: false,
             timing: None,
             failure: None,
             from_cache: false,

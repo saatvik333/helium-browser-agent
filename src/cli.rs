@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-/// Drive your running Helium, Chrome or Brave: profiles, tabs, pages, DevTools and extensions.
+/// Let coding agents use your running Helium, Chrome or Brave: your profiles and logins, their own tabs.
 ///
 /// TARGET is a ref from `hba snap` (e5, f1e3) or a Playwright selector: css, text=Save,
 /// role=button[name="Save"], internal:label="Email", xpath=//a.

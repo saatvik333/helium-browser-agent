@@ -1,35 +1,42 @@
 # hba
 
-`hba` drives your running [Helium](https://helium.computer/) browser from the shell: your own
-profiles and logins, tabs, pages, DevTools and extension development. Google Chrome and Brave work
-too (`browser = "chrome"` or `"brave"`). It is built for coding agents (one short command per
-step, compact output, errors that say what to do next) and works just as well by hand.
+**Let coding agents use your real browser: your logins, their own tabs.**
+
+`hba` is a command-line tool that connects to the browser you already have open
+([Helium](https://helium.computer/), Google Chrome or Brave). An agent such as Claude Code or Codex
+can then browse with your profiles, using the sites you're already signed in to. It works in
+background tabs of its own, and your tabs stay as they are.
 
 ```sh
-hba open github.com/notifications     # the session's own background tab in your profile; prints `t5 url "title"`
-hba snap -i                           # interactive elements with refs: - link "Inbox" [ref=e12]
-hba click e12                         # real mouse input; prints what changed (→ url, + popup, ! dialog, errors)
+hba open github.com/notifications     # a new background tab in your profile: t5 https://github.com/notifications "Notifications"
+hba snap -i                           # what can be clicked or filled: - link "Inbox" [ref=e12]
+hba click e12                         # a real mouse click; prints what changed (new URL, popups, dialogs, errors)
 hba fill 'internal:label="Search"i' 'is:open' --submit
-hba close                             # closes this session's tabs
+hba close                             # closes the tabs this session opened
 ```
 
-- **Your browser, not a copy.** `hba` attaches to the browser you already run, over a loopback
-  DevTools port whose owner it verifies. Agents get their own background tabs; your tabs are
-  untouched unless you hand one over (`hba tab use t42`).
-- **Fast.** A small daemon keeps one DevTools connection open, so commands take milliseconds and
-  the browser never restarts.
-- **Hard to detect.** Page work runs in an isolated world that pages cannot see, input is trusted
-  mouse and keyboard events with human timing on websites, and the `Runtime` and `Log` domains that
-  anti-bot scripts probe for stay off on websites unless you ask.
-- **Full DevTools.** Console, exceptions, network log with bodies, blocking and mocking, HAR,
-  performance traces, CPU profiles, heap snapshots, coverage, web vitals, emulation, cookies and
-  storage.
-- **Extension development.** Load, reload and remove unpacked extensions, read their service-worker
-  and page consoles, errors and storage, evaluate in the service worker or a content script, and
-  drive the popup like a page.
+- **Your browser, not a copy.** No second browser and no new profile to sign in to: `hba` attaches
+  to the running browser over a DevTools port on loopback, after checking that the port belongs to
+  that browser.
+- **Your tabs stay yours.** An agent can act only on tabs it opened, or on one you hand it with
+  `hba tab use t42`. `hba tab release` gives that tab back.
+- **Milliseconds per command.** A small background process keeps one connection open. Reading a
+  page takes 2–4 ms and a snapshot 12–21 ms, measured on Helium with 97 open tabs
+  ([details](docs/architecture.md#performance)).
+- **Acts like a person on websites.** Clicks and keystrokes are real input events, with human
+  pacing on websites. hba's page code runs where page scripts can't see it, and the debugging
+  features that anti-bot scripts look for stay off on websites unless you turn them on.
+- **DevTools from the shell.** Console and errors, the network log with bodies, blocking and mocks,
+  HAR files, performance traces, CPU profiles, heap snapshots, coverage, web vitals, emulation,
+  cookies and storage.
+- **Extension development.** Load, reload and remove unpacked extensions, read their logs, errors
+  and storage, evaluate code in their service worker or content script, and use the popup like a
+  page.
+- **Written for models.** Commands print compact text, one fact per line, and errors say which
+  command to run next. `--json` is there when you need structured output.
 
-The page engine is [Playwright](https://playwright.dev/)'s injected script (accessibility snapshot,
-selectors, actionability checks), vendored and pinned.
+Snapshots, selectors and the checks before each click come from [Playwright](https://playwright.dev/)'s
+page script, copied into this repo at a pinned version.
 
 ## Requirements
 
@@ -63,7 +70,7 @@ selectors, actionability checks), vendored and pinned.
 Paste this into your coding agent (Claude Code, Codex, omp, …):
 
 ```
-Fetch and follow the instructions at https://raw.githubusercontent.com/saatvik333/helium-browser-agent/main/AGENT-SETUP.md to set up hba for me.
+Fetch and follow the instructions at https://raw.githubusercontent.com/saatvik333/hba/main/AGENT-SETUP.md to set up hba for me.
 ```
 
 It installs `hba`, turns on your browser's DevTools access (asking before restarting it), links

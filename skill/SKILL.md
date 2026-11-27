@@ -1,14 +1,14 @@
 ---
 name: hba
-description: "Drive the user's own running browser (Helium, Chrome or Brave, with their logged-in profiles) from the shell: open, read, click, fill, tabs, screenshots, console/network/performance, and extension development (load, reload, logs, errors, popup, storage). Use for any browser task that needs real interaction, the user's sessions, or Chromium DevTools."
+description: "Use the user's own running browser (Helium, Chrome or Brave), signed in to their accounts, from the shell: open pages, read them, click and fill forms, manage tabs, take screenshots, read the console, network and performance data, and develop extensions (load, reload, logs, errors, popup, storage). Use it for any browser task that needs real interaction, the user's logins, or Chromium DevTools."
 ---
 
-# hba — the user's browser, from the shell
+# hba: the user's own browser, from the shell
 
-`hba` talks to the user's running browser (Helium by default; Chrome or Brave when configured)
-over DevTools through a background daemon (each call takes milliseconds). It works in **its own
-tabs** in the user's real, logged-in profiles. A plain public fetch needs no browser: use your
-fetch/read tool for that.
+`hba` connects to the browser the user already has open (Helium by default, Chrome or Brave when
+configured) through a background process, so each command takes milliseconds. You work in **your
+own tabs**, in the user's real profiles and with their logins. For a plain fetch of a public page
+you don't need a browser: use your fetch or read tool.
 
 ## The loop
 ```sh
@@ -101,7 +101,7 @@ hba js --world my-ext 'window.contentState'   # in the content script's world (t
 ## Behaviour to rely on
 - Input is real (trusted) mouse and keyboard; on websites it moves and types like a person, on local
   pages it is instant. hba's own page code runs in a hidden isolated world. Don't add your own JS
-  shortcuts (e.g. `element.click()` via `js`) when a real action exists — they look automated.
+  shortcuts (e.g. `element.click()` via `js`) when a real action exists: they look automated.
 - Errors say what to run next (re-snap, accept a dialog, adopt a tab). Exit code 1 = failed, 2 = bad
   usage.
 - Login walls, MFA, captchas, purchases and anything irreversible: stop and ask the user.

@@ -3,9 +3,9 @@ name = "hba"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Drive your running Helium browser from the command line: profiles, tabs, pages, DevTools and extensions"
+description = "Let coding agents use your running browser (Helium, Chrome or Brave): your logins, their own tabs, DevTools and extensions"
 license = "Apache-2.0"
-repository = "https://github.com/saatvik333/helium-browser-agent"
+repository = "https://github.com/saatvik333/hba"
 readme = "README.md"
 publish = false
 

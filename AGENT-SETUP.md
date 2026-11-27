@@ -1,9 +1,9 @@
 # Set up hba (instructions for a coding agent)
 
-You are setting up `hba`, a CLI that lets coding agents drive the user's own running browser:
-Helium (the default and recommended), Google Chrome or Brave. Follow these steps in order. Run each
-command yourself, check its result, and stop to ask the user only where a step says so. Tell the
-user what you did at the end.
+You are setting up `hba`, a CLI that lets coding agents use the user's own running browser, with
+its logins, in tabs of their own: Helium (the default and recommended), Google Chrome or Brave.
+Follow these steps in order. Run each command yourself, check its result, and stop to ask the
+user only where a step says so. Tell the user what you did at the end.
 
 ## 1. Check the machine
 
@@ -20,7 +20,7 @@ user what you did at the end.
 
 ```sh
 src="${XDG_DATA_HOME:-$HOME/.local/share}/hba"
-if [ -d "$src/.git" ]; then git -C "$src" pull --ff-only; else git clone https://github.com/saatvik333/helium-browser-agent "$src"; fi
+if [ -d "$src/.git" ]; then git -C "$src" pull --ff-only; else git clone https://github.com/saatvik333/hba "$src"; fi
 cargo install --path "$src" --locked
 hba --version
 ```

@@ -261,7 +261,7 @@ fn frame_functions(code: &str) -> Vec<String> {
         !tail_code.is_empty()
             && !tail_code.starts_with("//")
             && !line.contains("//")
-            && (c == ';' || ends_statement(line, tail))
+            && (c == ';' || ends_statement(head, line, tail))
     });
     if let Some((at, _)) = split {
         let (head, last) = (&expression[..=at], &expression[at + 1..]);
@@ -275,16 +275,23 @@ fn frame_functions(code: &str) -> Vec<String> {
 /// returned alone. Not when `tail` continues it (`a\n+ b`, `f\n(x)`, `a\n.b`) or when `line`
 /// heads a statement that takes the next one as its body (`if (c)\nf()`, `else\nf()`):
 /// returning there would run different code instead of failing to compile.
-fn ends_statement(line: &str, tail: &str) -> bool {
+fn ends_statement(head: &str, line: &str, tail: &str) -> bool {
+    fn words(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+    }
     let line = line.trim();
     let tail = tail.trim_start();
     let continues =
         tail.starts_with(['+', '-', '*', '/', '%', '(', '[', '`', '.', ',', '?', ':', '=', '<', '>', '&', '|', '^']);
-    let first = line.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+    let first = words(line).next().unwrap_or("");
+    // A loop header can follow other statements or a label, or wrap over lines: any `)` ending
+    // a line of code that has a loop keyword may close one.
+    let loop_header = line.ends_with(')') && words(head).any(|word| matches!(word, "for" | "while" | "with"));
     let heads = matches!(first, "if" | "for" | "while" | "else" | "do" | "with") || line.ends_with("=>");
     !line.is_empty()
         && !continues
         && !heads
+        && !loop_header
         && !line.ends_with(['{', '(', '[', ',', '+', '-', '*', '/', '=', '&', '|', '?', ':'])
 }
 
@@ -386,11 +393,22 @@ mod tests {
     #[test]
     fn frame_code_is_never_split_where_a_statement_goes_on() {
         // The next line continues the statement: returning it alone would change what runs.
-        for code in
-            ["const t = a\n  + b", "x = y\n(z)", "x = 1; // a; b", "if (c)\nf()", "a\n.b()", "const f = x =>\nx"]
-        {
+        for code in [
+            "const t = a\n  + b",
+            "x = y\n(z)",
+            "x = 1; // a; b",
+            "if (c)\nf()",
+            "a\n.b()",
+            "const f = x =>\nx",
+            "outer: while (c)\nf()",
+            "for (const a of\n xs)\nf(a)",
+        ] {
             assert_eq!(frame_functions(code).len(), 2, "{code:?} was split: {:?}", frame_functions(code));
         }
+        // A `;` split before the loop is harmless (`return (for …)` does not compile); returning
+        // the loop body alone would run it once.
+        let forms = frame_functions("x(); for (const a of xs)\nf(a)");
+        assert!(forms.iter().all(|form| !form.contains("return (f(a)")), "{forms:?}");
         let forms = frame_functions("const t = a\n  + b; t");
         assert!(forms[1].contains("+ b;\nreturn ( t\n);"), "{forms:?}");
         // Lines without semicolons still give the last value, as `js` does.

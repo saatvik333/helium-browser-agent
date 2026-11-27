@@ -243,15 +243,24 @@ impl Page {
     }
 }
 
-/// The ways [`Page::evaluate_in_frame`] runs `code`, in order: as an expression, then as
-/// statements. The code runs in an async function, so whatever it throws rejects the promise
-/// the call returns: only code that does not compile as one form is tried as the next.
-fn frame_functions(code: &str) -> [String; 2] {
+/// The ways [`Page::evaluate_in_frame`] runs `code`, in order: as an expression, as statements
+/// returning the last one's value (as `js` on the main frame does), then as plain statements.
+/// The code runs in an async function, so whatever it throws rejects the promise the call
+/// returns: only code that does not compile as one form is tried as the next. A split inside a
+/// string or comment does not compile, so it falls through to the next form.
+fn frame_functions(code: &str) -> Vec<String> {
+    let wrap =
+        |body: String| format!("function() {{ return (async function() {{ {body}\n }}).call(this.defaultView); }}");
     let expression = code.trim_end().trim_end_matches(';');
-    [
-        format!("function() {{ return (async function() {{ return ({expression}\n); }}).call(this.defaultView); }}"),
-        format!("function() {{ return (async function() {{ {code}\n }}).call(this.defaultView); }}"),
-    ]
+    let mut forms = vec![wrap(format!("return ({expression}\n);"))];
+    if let Some(split) = expression.rfind([';', '\n'])
+        && !expression[split + 1..].trim().is_empty()
+    {
+        let (head, last) = (&expression[..=split], &expression[split + 1..]);
+        forms.push(wrap(format!("{head}\nreturn ({last}\n);")));
+    }
+    forms.push(wrap(code.to_owned()));
+    forms
 }
 
 fn is_stale(error: &anyhow::Error) -> bool {
@@ -339,10 +348,13 @@ mod tests {
 
     #[test]
     fn frame_code_is_an_expression_first_and_never_eval() {
-        let [expression, statements] = frame_functions("await fetch('/x');  ");
-        assert!(expression.contains("return (await fetch('/x')\n)"), "{expression}");
-        assert!(statements.contains("{ await fetch('/x');  \n }"), "{statements}");
+        let forms = frame_functions("await fetch('/x');  ");
+        assert_eq!(forms.len(), 2, "{forms:?}");
+        assert!(forms[0].contains("return (await fetch('/x')\n)"), "{}", forms[0]);
+        assert!(forms[1].contains("{ await fetch('/x');  \n }"), "{}", forms[1]);
+        let forms = frame_functions("const a = 1; a + 1");
+        assert!(forms[1].contains("const a = 1;\nreturn ( a + 1\n);"), "{forms:?}");
         // `eval` is subject to the page's content security policy; a function declaration is not.
-        assert!(!expression.contains("eval") && !statements.contains("eval"));
+        assert!(forms.iter().all(|form| !form.contains("eval")));
     }
 }

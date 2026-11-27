@@ -1,9 +1,11 @@
 //! Debugger sessions on extension targets (service workers, background pages, extension pages),
 //! the console captured through them, evaluation, and short-lived helper pages.
 //!
-//! A session stays attached once made. An attached debugger keeps a service worker running, as
-//! the developer tools do, and outlives the worker being stopped and started again, so captured logs
-//! continue across restarts. A reload installs a new worker, whose session replaces the old one.
+//! Log capture keeps its sessions attached. An attached debugger keeps a service worker running,
+//! as the developer tools do, and outlives the worker being stopped and started again, so captured
+//! logs continue across restarts. A reload installs a new worker, whose session replaces the old
+//! one. Without capture, `ext eval` and `ext storage` attach for the one command, so the worker
+//! idles out as it would without hba.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -119,6 +121,17 @@ impl State {
 
     fn session_of(&self, target: &str) -> Option<Arc<str>> {
         self.sessions.get(target).map(|attached| Arc::clone(&attached.session))
+    }
+
+    /// Whether capture starts the extension's stopped service worker: when no capture session
+    /// logs it. Decided by the sessions, not by whether capture ran before: a capture that failed
+    /// or was cancelled half way left none, and the worker starts only on demand.
+    fn wakes_worker(&self, ext: &Extension) -> bool {
+        let logged = self
+            .sessions
+            .values()
+            .any(|attached| attached.extension == ext.id && attached.kind == Kind::Worker && attached.logging);
+        !logged && ext.enabled && ext.manifest.background == Background::Worker
     }
 
     /// Removes the sessions `stale` selects and returns them for detaching.
@@ -266,7 +279,7 @@ fn adopt_page(browser: &Arc<Browser>, info: Arc<TargetInfo>) {
         let attached = browser.extensions.lock().expect("extensions lock").sessions.contains_key(&info.target_id);
         if !attached {
             // The page may close before hba attaches; the next `hba ext logs` looks again.
-            attach(&browser, &info, &id, Kind::Page, true).await.ok();
+            attach(&browser, &info, &id, Kind::Page).await.ok();
         }
     });
 }
@@ -290,14 +303,66 @@ struct Created {
     target_id: String,
 }
 
-/// Attaches to an extension target and keeps the session; with `logging`, enables `Runtime` and
-/// `Log`, which replay what the target logged before.
-async fn attach(
-    browser: &Arc<Browser>,
+/// Attaches log capture to an extension target and keeps the session, with `Runtime` and `Log`
+/// on once it returns; they replay what the target logged before. A task of its own, so a command
+/// cancelled meanwhile still leaves the session where `release` and `forget` find it.
+async fn attach(browser: &Arc<Browser>, target: &TargetInfo, extension: &str, kind: Kind) -> Result<Arc<str>> {
+    let (browser, target, extension) = (Arc::clone(browser), target.clone(), extension.to_owned());
+    crate::devtools::to_completion(async move {
+        let session = connect(&browser, &target, kind, Some(feed(&browser))).await?;
+        // Recorded before `Runtime.enable`, whose replayed messages arrive before its reply.
+        let replaced = browser.extensions.lock().expect("extensions lock").sessions.insert(
+            target.target_id.clone(),
+            Attached { session: Arc::clone(&session), extension, kind, logging: false },
+        );
+        if let Some(replaced) = replaced {
+            detach(&browser.cdp, &replaced.session).await;
+        }
+        let enabled = enable_logging(&browser.cdp, &session).await;
+        {
+            let mut state = browser.extensions.lock().expect("extensions lock");
+            let own = state.sessions.get(&target.target_id).is_some_and(|attached| attached.session == session);
+            match (&enabled, own) {
+                (Ok(()), true) => {
+                    if let Some(attached) = state.sessions.get_mut(&target.target_id) {
+                        attached.logging = true;
+                    }
+                }
+                (Err(_), true) => {
+                    state.sessions.remove(&target.target_id);
+                }
+                (_, false) => {}
+            }
+        }
+        if enabled.is_err() {
+            detach(&browser.cdp, &session).await;
+        }
+        enabled.map(|()| session)
+    })
+    .await
+}
+
+/// Attaches to `target` for one command, in a task of its own: the lease detaches the session
+/// when it ends or is dropped, which a command cancelled meanwhile does once the task ends.
+async fn single_use(browser: &Arc<Browser>, target: &TargetInfo, kind: Kind) -> Result<Lease> {
+    let (browser, target) = (Arc::clone(browser), target.clone());
+    crate::devtools::to_completion(async move {
+        let session = connect(&browser, &target, kind, None).await?;
+        let (cdp, own) = (browser.cdp.clone(), Arc::clone(&session));
+        let release = Undo::new(async move { detach(&cdp, &own).await });
+        Ok(Lease { session, detach: Some(release) })
+    })
+    .await
+}
+
+/// Attaches to an extension target: a worker waiting for its debugger resumes, and a worker's
+/// extension APIs are ready on return. With `events`, the session's events go there and a page
+/// reports its navigations, so its session can be dropped before a website's document loads.
+async fn connect(
+    browser: &Browser,
     target: &TargetInfo,
-    extension: &str,
     kind: Kind,
-    logging: bool,
+    events: Option<mpsc::UnboundedSender<Event>>,
 ) -> Result<Arc<str>> {
     let attached: crate::page::Attached = browser
         .cdp
@@ -305,11 +370,14 @@ async fn attach(
         .await
         .with_context(|| format!("attaching to {}", target.url))?;
     let session: Arc<str> = Arc::from(attached.session_id);
-    browser.cdp.route(&session, feed(browser));
+    let routed = events.is_some();
+    if let Some(events) = events {
+        browser.cdp.route(&session, events);
+    }
     // A worker started while a debugger was expected waits for one; this attach is it. Resumed
     // that early, it gets its extension APIs a moment later.
     browser.cdp.send("Runtime.runIfWaitingForDebugger", json!({}), Some(&session)).await.ok();
-    if kind == Kind::Page {
+    if kind == Kind::Page && routed {
         // Reports the main frame's navigations as they start, so the session is dropped before a
         // website's document loads with `Runtime` on (`Page` is invisible to pages).
         browser.cdp.send("Page.enable", json!({}), Some(&session)).await.ok();
@@ -323,18 +391,6 @@ async fn attach(
         {
             tokio::time::sleep(POLL).await;
         }
-    }
-    let replaced = browser.extensions.lock().expect("extensions lock").sessions.insert(
-        target.target_id.clone(),
-        Attached { session: Arc::clone(&session), extension: extension.to_owned(), kind, logging },
-    );
-    if let Some(replaced) = replaced {
-        detach(&browser.cdp, &replaced.session).await;
-    }
-    if logging && let Err(error) = enable_logging(&browser.cdp, &session).await {
-        browser.extensions.lock().expect("extensions lock").sessions.remove(&target.target_id);
-        detach(&browser.cdp, &session).await;
-        return Err(error);
     }
     Ok(session)
 }
@@ -354,6 +410,28 @@ async fn detach(cdp: &Cdp, session: &str) {
     cdp.send("Target.detachFromTarget", json!({"sessionId": session}), None).await.ok();
 }
 
+/// A session one command uses: a capture session, which stays, or one attached for the command
+/// alone and detached when the lease ends or is dropped (a cancelled command included).
+pub struct Lease {
+    pub session: Arc<str>,
+    /// Detaches a session attached for the command alone.
+    detach: Option<Undo>,
+}
+
+impl Lease {
+    /// Whether the session stays attached after the command.
+    pub fn kept(&self) -> bool {
+        self.detach.is_none()
+    }
+
+    /// Ends the command's use of the session, waiting for a single-use session to detach.
+    pub async fn end(self) {
+        if let Some(detach) = self.detach {
+            detach.finish().await;
+        }
+    }
+}
+
 /// What starting log capture found.
 #[derive(Debug)]
 pub struct Capture {
@@ -365,6 +443,9 @@ pub struct Capture {
     pub worker: bool,
     /// Extension pages captured.
     pub pages: usize,
+    /// Why the stopped service worker of a running capture did not start; what was captured
+    /// before is still there.
+    pub wake_error: Option<String>,
 }
 
 /// Extension debugging in one profile of the connected browser.
@@ -406,8 +487,8 @@ impl Debugger<'_> {
         self.state().sessions.values().any(|attached| attached.extension == id && attached.kind != Kind::Page)
     }
 
-    /// A session on the service worker or background page, starting a stopped worker.
-    pub async fn worker(&self, ext: &Extension) -> Result<Arc<str>> {
+    /// A session for one command on the service worker or background page, starting a stopped worker.
+    pub async fn worker(&self, ext: &Extension) -> Result<Lease> {
         let name = ext.name();
         let kind = match ext.manifest.background {
             Background::Worker => Kind::Worker,
@@ -429,17 +510,24 @@ impl Debugger<'_> {
             None if kind == Kind::Worker => self.wake(ext).await?,
             None => bail!("{name}'s background page is not running; `hba ext reload {:?}` restarts it", ext.id),
         };
+        self.lease(ext, &target, kind).await
+    }
+
+    /// A session on `target` for one command: the capture session, attaching one while capture
+    /// runs, else one for the command alone.
+    async fn lease(&self, ext: &Extension, target: &TargetInfo, kind: Kind) -> Result<Lease> {
         let known = self.state().session_of(&target.target_id);
         let session = match known {
             Some(session) => session,
-            None => attach(self.browser, &target, &ext.id, kind, self.capturing(&ext.id)).await?,
+            None if self.capturing(&ext.id) => attach(self.browser, target, &ext.id, kind).await?,
+            None => return single_use(self.browser, target, kind).await,
         };
-        Ok(session)
+        Ok(Lease { session, detach: None })
     }
 
     /// A session `Extensions.*StorageItems` accepts: the worker or background page, else an open
     /// extension page (hidden helper pages are refused).
-    pub async fn storage_session(&self, ext: &Extension) -> Result<Arc<str>> {
+    pub async fn storage_session(&self, ext: &Extension) -> Result<Lease> {
         if !ext.enabled {
             bail!("{} is disabled", ext.name());
         }
@@ -456,11 +544,7 @@ impl Debugger<'_> {
                 ext.id
             );
         };
-        let known = self.state().session_of(&page.target_id);
-        match known {
-            Some(session) => Ok(session),
-            None => attach(self.browser, page, &ext.id, Kind::Page, self.capturing(&ext.id)).await,
-        }
+        self.lease(ext, page, Kind::Page).await
     }
 
     /// Starts the stopped service worker without attaching; `false` when it was running.
@@ -541,28 +625,50 @@ impl Debugger<'_> {
     }
 
     /// Starts capturing the extension's console (once) and attaches it to every target: the
-    /// worker (started when stopped, the first time), background page and extension pages.
+    /// worker (started when stopped and no capture session logs it), background page and
+    /// extension pages.
     pub async fn capture(&self, ext: &Extension) -> Result<Capture> {
         let gate = self.gate();
         let guard = gate.lock().await;
-        let started = {
+        let (started, wake_worker) = {
             let mut state = self.state();
             let started = !state.logs.contains_key(&ext.id);
             state.logs.entry(ext.id.clone()).or_default();
-            started
+            (started, state.wakes_worker(ext))
         };
+        let attached = self.attach_capture(ext, wake_worker, started).await;
+        if attached.is_err() && started {
+            self.state().logs.remove(&ext.id);
+        }
+        let (targets, woke, wake_error) = attached?;
+        drop(guard);
+        self.flush().await;
+        let worker = targets.iter().any(|target| Kind::of(target).is_some_and(|kind| kind != Kind::Page));
+        let pages = targets.iter().filter(|target| Kind::of(target) == Some(Kind::Page)).count();
+        Ok(Capture { started, woke, worker, pages, wake_error })
+    }
+
+    /// Attaches capture to every target of the extension, first starting its stopped worker when
+    /// `wake_worker`. Returns the targets, whether the worker was started, and why it did not start
+    /// when capture was already running (`started` false), which leaves the earlier messages.
+    async fn attach_capture(
+        &self,
+        ext: &Extension,
+        wake_worker: bool,
+        started: bool,
+    ) -> Result<(Vec<TargetInfo>, bool, Option<String>)> {
         let mut targets = self.targets(&ext.id).await?;
-        let first_worker_capture = started && ext.enabled && ext.manifest.background == Background::Worker;
         let mut woke = false;
-        if first_worker_capture && running(&targets, Kind::Worker).is_none() {
+        let mut wake_error = None;
+        if wake_worker && running(&targets, Kind::Worker).is_none() {
             match self.wake(ext).await {
-                Ok(worker) => targets.push(worker),
-                Err(error) => {
-                    self.state().logs.remove(&ext.id);
-                    return Err(error);
+                Ok(worker) => {
+                    targets.push(worker);
+                    woke = true;
                 }
+                Err(error) if started => return Err(error),
+                Err(error) => wake_error = Some(format!("{error:#}")),
             }
-            woke = true;
         }
         self.drop_stale(&ext.id, &targets).await;
         for target in &targets {
@@ -581,18 +687,14 @@ impl Debugger<'_> {
                         attached.logging = true;
                     }
                 }),
-                None => attach(self.browser, target, &ext.id, kind, true).await.map(drop),
+                None => attach(self.browser, target, &ext.id, kind).await.map(drop),
             };
             // Pages come and go at any moment; only the worker must be reachable.
             if kind != Kind::Page {
                 outcome?;
             }
         }
-        drop(guard);
-        self.flush().await;
-        let worker = targets.iter().any(|target| Kind::of(target).is_some_and(|kind| kind != Kind::Page));
-        let pages = targets.iter().filter(|target| Kind::of(target) == Some(Kind::Page)).count();
-        Ok(Capture { started, woke, worker, pages })
+        Ok((targets, woke, wake_error))
     }
 
     /// Detaches sessions of the extension's closed pages and replaced workers. A stopped worker
@@ -629,8 +731,9 @@ impl Debugger<'_> {
         (earlier, log.entries.iter().skip(earlier).cloned().collect())
     }
 
-    /// Forgets captured entries; returns how many there were.
-    pub fn clear(&self, id: &str) -> usize {
+    /// Forgets captured entries, those already received included; returns how many there were.
+    pub async fn clear(&self, id: &str) -> usize {
+        self.flush().await;
         self.state().logs.get_mut(id).map_or(0, |log| {
             let count = log.entries.len();
             log.clear();
@@ -810,6 +913,36 @@ mod tests {
         );
         assert_eq!(state.record(&away).as_deref(), Some("S1"), "the session is handed back for detaching");
         assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn capture_starts_the_worker_until_a_session_logs_it() {
+        let mut ext = Extension {
+            id: ID.to_owned(),
+            manifest: catalog::Manifest { background: Background::Worker, ..catalog::Manifest::default() },
+            enabled: true,
+            location: catalog::Location::Unpacked,
+            dir: None,
+        };
+        let mut state = State::default();
+        // What a first capture that failed or was cancelled after recording the log leaves.
+        state.logs.insert(ID.to_owned(), Log::default());
+        assert!(state.wakes_worker(&ext), "capture ran before, but nothing logs the worker");
+        let session = |extension: &str, kind: Kind, logging: bool| Attached {
+            session: Arc::from("S1"),
+            extension: extension.to_owned(),
+            kind,
+            logging,
+        };
+        state.sessions.insert("PAGE".to_owned(), session(ID, Kind::Page, true));
+        state.sessions.insert("OTHER".to_owned(), session("blockjmkbacgjkknlgpkjjiijinjdanf", Kind::Worker, true));
+        state.sessions.insert("W".to_owned(), session(ID, Kind::Worker, false));
+        assert!(state.wakes_worker(&ext), "pages, other extensions and a worker whose Runtime is not on yet");
+        state.sessions.insert("W".to_owned(), session(ID, Kind::Worker, true));
+        assert!(!state.wakes_worker(&ext), "a logged worker starts on its own events");
+        state.sessions.clear();
+        ext.enabled = false;
+        assert!(!state.wakes_worker(&ext), "a disabled extension has no worker to start");
     }
 
     #[test]

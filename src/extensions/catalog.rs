@@ -15,8 +15,10 @@ pub enum Location {
     Store,
     /// A `.crx` installed by hand.
     Packed,
-    /// Loaded from a directory (`hba ext load`, "Load unpacked", `--load-extension`).
+    /// Loaded from a directory (`hba ext load`, "Load unpacked").
     Unpacked,
+    /// Loaded from a directory named by `--load-extension`.
+    CommandLine,
     /// Bundled with Helium.
     Component,
     /// Forced by policy.
@@ -32,11 +34,17 @@ impl Location {
         Some(match code {
             1 if entry.get("from_webstore").and_then(Value::as_bool) == Some(true) => Self::Store,
             1 => Self::Packed,
-            4 | 8 => Self::Unpacked,
+            4 => Self::Unpacked,
+            8 => Self::CommandLine,
             5 | 10 => Self::Component,
             7 | 9 => Self::Policy,
             _ => Self::External,
         })
+    }
+
+    /// Whether the extension runs from a directory, as Chromium's `IsUnpackedLocation` says.
+    pub fn is_unpacked(self) -> bool {
+        matches!(self, Self::Unpacked | Self::CommandLine)
     }
 
     pub fn label(self) -> &'static str {
@@ -44,6 +52,7 @@ impl Location {
             Self::Store => "store",
             Self::Packed => "packed",
             Self::Unpacked => "unpacked",
+            Self::CommandLine => "command-line",
             Self::Component => "component",
             Self::Policy => "policy",
             Self::External => "external",
@@ -245,14 +254,15 @@ fn disabled(entry: &Value) -> bool {
 }
 
 /// Replaces the unpacked extensions with the ones the browser reports: `Preferences` is written
-/// seconds after a load or removal, the browser knows immediately.
+/// seconds after a load or removal, the browser knows immediately. The browser does not say which
+/// came from `--load-extension`; the preferences do.
 pub fn merge_loaded(list: &mut Vec<Extension>, loaded: Vec<Loaded>) {
-    list.retain(|known| known.location != Location::Unpacked || loaded.iter().any(|item| item.id == known.id));
+    list.retain(|known| !known.location.is_unpacked() || loaded.iter().any(|item| item.id == known.id));
     for item in loaded {
         let mut manifest = Manifest::load(&item.path).unwrap_or_default();
         manifest.name = item.name;
         manifest.version = item.version;
-        let extension = Extension {
+        let mut extension = Extension {
             id: item.id,
             manifest,
             enabled: item.enabled,
@@ -260,7 +270,12 @@ pub fn merge_loaded(list: &mut Vec<Extension>, loaded: Vec<Loaded>) {
             dir: Some(item.path),
         };
         match list.iter_mut().find(|known| known.id == extension.id) {
-            Some(known) => *known = extension,
+            Some(known) => {
+                if known.location == Location::CommandLine {
+                    extension.location = Location::CommandLine;
+                }
+                *known = extension;
+            }
             None => list.push(extension),
         }
     }
@@ -288,7 +303,7 @@ pub fn resolve<'a>(list: &'a [Extension], query: &str, dir: Option<&Path>) -> Re
     if let Some(dir) = dir {
         let wanted = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let found = list.iter().find(|extension| {
-            extension.location == Location::Unpacked
+            extension.location.is_unpacked()
                 && extension
                     .dir
                     .as_deref()
@@ -503,6 +518,26 @@ mod tests {
             [("Another", "1", false), ("New name", "2.0", true), ("uBlock Origin", "1.0", true)],
             "unpacked entries the browser no longer lists are gone; others stay"
         );
+    }
+
+    #[test]
+    fn command_line_extensions_stay_apart_from_unpacked_ones() {
+        assert_eq!(Location::of(&json!({"location": 4})), Some(Location::Unpacked));
+        assert_eq!(Location::of(&json!({"location": 8})), Some(Location::CommandLine), "--load-extension");
+        assert!(Location::CommandLine.is_unpacked() && Location::Unpacked.is_unpacked());
+        assert!(!Location::Store.is_unpacked());
+        let mut list = vec![extension(UNPACKED, "Flagged", Location::CommandLine, Some("/nowhere/flagged"))];
+        let loaded = vec![Loaded {
+            id: UNPACKED.to_owned(),
+            name: "Flagged".to_owned(),
+            version: "1".to_owned(),
+            path: "/nowhere/flagged".into(),
+            enabled: true,
+        }];
+        merge_loaded(&mut list, loaded);
+        assert_eq!(list[0].location, Location::CommandLine, "the browser lists both kinds alike");
+        let found = resolve(&list, "./flagged", Some(Path::new("/nowhere/flagged"))).map(|e| e.id.as_str());
+        assert_eq!(found.ok(), Some(UNPACKED), "found by its directory");
     }
 
     #[test]

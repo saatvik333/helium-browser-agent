@@ -22,9 +22,12 @@ use tokio::time::Instant;
 
 use crate::browser::{Browser, TargetEvent};
 use crate::cli::{ExtOp, ExtStorageArea, LoadState, StorageOp, SwAction};
+use crate::config::BrowserKind;
 use crate::console::Entry;
 use crate::daemon::Cx;
-use crate::output::{render_value, short_url, truncate};
+use crate::devtools::{BUDGET, note_earlier};
+use crate::inspect::emit_budgeted;
+use crate::output::{self, render_value, short_url, truncate};
 use crate::page::{ExecutionContext, Page};
 use crate::profiles::Profile;
 use crate::undo::Undo;
@@ -65,11 +68,14 @@ pub async fn ext(cx: &mut Cx<'_>, op: Option<ExtOp>) -> Result<()> {
         }
         ExtOp::Eval { ext, code } => {
             let ext = scope.find(cx, &ext).await?;
-            let session = scope.debugger().worker(&ext).await?;
+            let lease = scope.debugger().worker(&ext).await?;
             let cdp = &scope.browser.cdp;
-            let value = crate::page::evaluate_on(cdp, &session, None, &code, false, cx.timeout).await;
-            // The worker session outlives the command, so its result objects are released here.
-            cdp.send("Runtime.releaseObjectGroup", json!({"objectGroup": "hba"}), Some(&session)).await.ok();
+            let value = crate::page::evaluate_on(cdp, &lease.session, None, &code, false, cx.timeout).await;
+            if lease.kept() {
+                // A capture session outlives the command, so its result objects are released here.
+                cdp.send("Runtime.releaseObjectGroup", json!({"objectGroup": "hba"}), Some(&lease.session)).await.ok();
+            }
+            lease.end().await;
             cx.say(render_value(&value?, RESULT_MAX));
             Ok(())
         }
@@ -213,8 +219,7 @@ async fn list(cx: &mut Cx<'_>, scope: &Scope) -> Result<()> {
         if logs {
             flags.push("logs captured".to_owned());
         }
-        let path =
-            ext.dir.as_deref().filter(|_| ext.location == Location::Unpacked).map(|dir| format!(" {}", tilde(dir)));
+        let path = ext.dir.as_deref().filter(|_| ext.location.is_unpacked()).map(|dir| format!(" {}", tilde(dir)));
         cx.say(format!(
             "{} {} {} [{}]{}",
             ext.id,
@@ -238,7 +243,8 @@ async fn load(cx: &mut Cx<'_>, scope: &Scope, dir: &Path) -> Result<()> {
         bail!("{} has no manifest.json", tilde(&dir));
     }
     let path = dir.to_str().context("the directory path is not valid UTF-8")?;
-    let before = loaded(&scope.browser).await?;
+    // The switch that refuses `loadUnpacked` refuses this too; its error below says what to do.
+    let before = loaded(&scope.browser).await.unwrap_or_default();
     // Loading a directory again reloads its extension; its current worker must not be mistaken for the new one.
     let previous = before.iter().find(|known| known.path == dir).map(|known| known.id.clone());
     let old = match &previous {
@@ -343,13 +349,7 @@ async fn reload(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension) -> Result<()> {
 }
 
 async fn remove(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension) -> Result<()> {
-    if ext.location != Location::Unpacked {
-        bail!(
-            "{} is a {} extension; hba removes only unpacked ones (remove it in chrome://extensions)",
-            ext.name(),
-            ext.location.label()
-        );
-    }
+    check_removable(ext, &scope.profile, &scope.default, scope.browser.config().browser)?;
     scope
         .browser
         .cdp
@@ -361,22 +361,55 @@ async fn remove(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension) -> Result<()> {
     Ok(())
 }
 
+/// Refuses what `Extensions.uninstall` cannot remove: it removes only extensions loaded unpacked
+/// (not with `--load-extension`), and only from the browser's default profile, whichever profile
+/// the session uses.
+fn check_removable(ext: &Extension, profile: &Profile, default: &Profile, browser: BrowserKind) -> Result<()> {
+    let (name, page) = (browser.name(), format!("{}://extensions", browser.scheme()));
+    match ext.location {
+        Location::Unpacked => {}
+        Location::CommandLine => {
+            bail!("{} was loaded with --load-extension; it is gone once {name} starts without that flag", ext.name())
+        }
+        other => {
+            bail!(
+                "{} is a {} extension; hba removes only unpacked ones (remove it at {page})",
+                ext.name(),
+                other.label()
+            )
+        }
+    }
+    if profile != default {
+        bail!(
+            "{name} removes unpacked extensions only from its default profile {:?}; remove {} from {:?} at {page}",
+            default.name,
+            ext.name(),
+            profile.name
+        );
+    }
+    Ok(())
+}
+
 async fn logs(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension, last: usize, clear: bool) -> Result<()> {
     let debugger = scope.debugger();
-    let capture = debugger.capture(ext).await?;
     if clear {
-        let count = debugger.clear(&ext.id);
-        let plural = if count == 1 { "" } else { "s" };
-        cx.say(format!("cleared {count} message{plural} of {}", ext.name()));
+        // Without capture there is nothing to clear, and starting it would keep the worker running.
+        let count = debugger.clear(&ext.id).await;
+        cx.say(format!("cleared {} of {}", output::count(count, "message"), ext.name()));
         return Ok(());
     }
+    let capture = debugger.capture(ext).await?;
     let (earlier, entries) = debugger.entries(&ext.id, last);
     if cx.json {
         let items: Vec<Value> = entries.iter().map(Entry::json).collect();
         cx.say(Value::from(items).to_string());
         return Ok(());
     }
-    if capture.started {
+    let mut text = String::new();
+    if let Some(error) = &capture.wake_error {
+        let _ = writeln!(text, "{error}");
+    }
+    if capture.started || capture.woke {
         let worker = ext.manifest.background == Background::Worker;
         let mut sources = Vec::new();
         match (capture.worker, worker, capture.woke) {
@@ -386,23 +419,19 @@ async fn logs(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension, last: usize, clea
             (true, true, true) => sources.push("its service worker (started by hba)".to_owned()),
         }
         if capture.pages > 0 {
-            let plural = if capture.pages == 1 { "" } else { "s" };
-            sources.push(format!("{} page{plural}", capture.pages));
+            sources.push(output::count(capture.pages, "page"));
         }
         let from = if sources.is_empty() { "its pages as they open".to_owned() } else { sources.join(" and ") };
         let kept = if capture.worker && worker { "; hba stays attached, which keeps the worker running" } else { "" };
-        cx.say(format!("capturing the console of {} from {from}{kept}", ext.name()));
+        let _ = writeln!(text, "capturing the console of {} from {from}{kept}", ext.name());
     } else if entries.is_empty() {
-        cx.say(format!("no messages from {} yet", ext.name()));
+        let _ = writeln!(text, "no messages from {} yet", ext.name());
     }
-    if earlier > 0 {
-        let plural = if earlier == 1 { "" } else { "s" };
-        cx.say(format!("… {earlier} earlier message{plural} (raise -n)"));
-    }
+    note_earlier(&mut text, earlier, "earlier message");
     for entry in &entries {
-        cx.say(entry.line());
+        let _ = writeln!(text, "{}", entry.line());
     }
-    Ok(())
+    emit_budgeted(cx, &text, BUDGET, "ext-logs", "log", "use -n to narrow it")
 }
 
 async fn errors(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension, clear: bool) -> Result<()> {
@@ -415,28 +444,29 @@ async fn errors(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension, clear: bool) ->
         return Ok(());
     }
     let count = report.manifest.len() + report.runtime.len();
-    let plural = if count == 1 { "" } else { "s" };
-    cx.say(match (count, clear) {
-        (0, _) => format!("no errors recorded for {}", ext.name()),
-        (_, true) => format!("cleared {count} error{plural} of {}", ext.name()),
-        (_, false) => format!("{count} error{plural} recorded for {}", ext.name()),
-    });
+    let errors = output::count(count, "error");
+    let mut text = match (count, clear) {
+        (0, _) => format!("no errors recorded for {}\n", ext.name()),
+        (_, true) => format!("cleared {errors} of {}\n", ext.name()),
+        (_, false) => format!("{errors} recorded for {}\n", ext.name()),
+    };
     if report.enabled_developer_mode {
-        cx.say(format!(
+        let _ = writeln!(
+            text,
             "turned on developer mode: {} records runtime errors only in developer mode, so earlier ones were not kept; reproduce the problem and run this again",
             scope.browser.config().browser.name()
-        ));
+        );
     }
-    if clear {
-        return Ok(());
+    if !clear {
+        for warning in &report.manifest {
+            let _ = writeln!(text, "manifest {}", warning.message);
+        }
+        for error in &report.runtime {
+            let _ = writeln!(text, "{}", truncate(&error.summary(), ERROR_TEXT_MAX).replace('\n', "\n  "));
+        }
     }
-    for warning in &report.manifest {
-        cx.say(format!("manifest {}", warning.message));
-    }
-    for error in &report.runtime {
-        cx.say(truncate(&error.summary(), ERROR_TEXT_MAX).replace('\n', "\n  "));
-    }
-    Ok(())
+    let hint = format!("`hba ext errors {:?} --clear` forgets them", ext.id);
+    emit_budgeted(cx, &text, BUDGET, "ext-errors", "log", &hint)
 }
 
 async fn popup(cx: &mut Cx<'_>, scope: &Scope, ext: &Extension) -> Result<()> {
@@ -527,8 +557,8 @@ async fn storage(
         ExtStorageArea::Session => "session",
         ExtStorageArea::Managed => "managed",
     };
-    let session = scope.debugger().storage_session(ext).await?;
-    let cdp = &scope.browser.cdp;
+    let lease = scope.debugger().storage_session(ext).await?;
+    let (cdp, session) = (&scope.browser.cdp, &*lease.session);
     let params = |extra: Value| {
         let mut params = json!({"id": ext.id, "storageArea": area});
         if let (Some(params), Value::Object(extra)) = (params.as_object_mut(), extra) {
@@ -539,20 +569,23 @@ async fn storage(
     let name = ext.name();
     match op {
         None => {
-            let items: Items = cdp.call("Extensions.getStorageItems", params(json!({})), Some(&session)).await?;
+            let items: Items = cdp.call("Extensions.getStorageItems", params(json!({})), Some(session)).await?;
             if cx.json {
                 cx.say(Value::Object(items.data).to_string());
             } else if items.data.is_empty() {
                 cx.say(format!("{area} storage of {name} is empty"));
             } else {
+                let mut text = String::new();
                 for (key, value) in &items.data {
-                    cx.say(format!("{key} = {}", truncate(&value.to_string(), RESULT_MAX)));
+                    let _ = writeln!(text, "{key} = {}", truncate(&value.to_string(), RESULT_MAX));
                 }
+                let hint = format!("`hba ext storage {:?} {area} get KEY` prints one value", ext.id);
+                emit_budgeted(cx, &text, BUDGET, "ext-storage", "txt", &hint)?;
             }
         }
         Some(StorageOp::Get { key }) => {
             let items: Items =
-                cdp.call("Extensions.getStorageItems", params(json!({"keys": [key]})), Some(&session)).await?;
+                cdp.call("Extensions.getStorageItems", params(json!({"keys": [key]})), Some(session)).await?;
             let value = items.data.get(&key).with_context(|| format!("no {key:?} in {area} storage of {name}"))?;
             cx.say(if cx.json { value.to_string() } else { render_value(value, RESULT_MAX) });
         }
@@ -560,18 +593,19 @@ async fn storage(
             let value: Value = serde_json::from_str(&value).unwrap_or(Value::String(value));
             let mut values = Map::new();
             values.insert(key.clone(), value.clone());
-            cdp.send("Extensions.setStorageItems", params(json!({"values": values})), Some(&session)).await?;
+            cdp.send("Extensions.setStorageItems", params(json!({"values": values})), Some(session)).await?;
             cx.say(format!("set {area} {key} = {}", truncate(&value.to_string(), RESULT_MAX)));
         }
         Some(StorageOp::Rm { key }) => {
-            cdp.send("Extensions.removeStorageItems", params(json!({"keys": [key]})), Some(&session)).await?;
+            cdp.send("Extensions.removeStorageItems", params(json!({"keys": [key]})), Some(session)).await?;
             cx.say(format!("removed {area} {key}"));
         }
         Some(StorageOp::Clear) => {
-            cdp.send("Extensions.clearStorageItems", params(json!({})), Some(&session)).await?;
+            cdp.send("Extensions.clearStorageItems", params(json!({})), Some(session)).await?;
             cx.say(format!("cleared {area} storage of {name}"));
         }
     }
+    lease.end().await;
     Ok(())
 }
 
@@ -796,5 +830,34 @@ mod tests {
         assert_eq!(shorten(Path::new("/home/someone/codes/ext"), home), "~/codes/ext");
         assert_eq!(shorten(Path::new("/elsewhere/ext"), home), "/elsewhere/ext");
         assert_eq!(shorten(Path::new("/home/someone2/ext"), home), "/home/someone2/ext", "whole components only");
+    }
+
+    #[test]
+    fn only_unpacked_extensions_of_the_default_profile_are_removed() {
+        let profile = |name: &str, dir: &str| Profile { name: name.to_owned(), dir: dir.to_owned() };
+        let (default, work) = (profile("Personal", "Default"), profile("Work", "Profile 3"));
+        let ext = |location| Extension {
+            id: ID.to_owned(),
+            manifest: catalog::Manifest { name: "Mine".to_owned(), ..catalog::Manifest::default() },
+            enabled: true,
+            location,
+            dir: None,
+        };
+        let refusal = |location, profile: &Profile, browser| {
+            check_removable(&ext(location), profile, &default, browser).err().map(|error| error.to_string())
+        };
+        assert_eq!(refusal(Location::Unpacked, &default, BrowserKind::Helium), None);
+        assert_eq!(
+            refusal(Location::Unpacked, &work, BrowserKind::Helium).as_deref(),
+            Some(
+                "Helium removes unpacked extensions only from its default profile \"Personal\"; remove Mine from \
+                 \"Work\" at chrome://extensions"
+            ),
+            "the browser would remove the default profile's copy"
+        );
+        let flagged = refusal(Location::CommandLine, &default, BrowserKind::Chrome).expect("refused");
+        assert!(flagged.contains("--load-extension"), "{flagged}");
+        let store = refusal(Location::Store, &default, BrowserKind::Brave).expect("refused");
+        assert!(store.contains("store extension") && store.contains("brave://extensions"), "{store}");
     }
 }

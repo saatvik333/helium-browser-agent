@@ -217,7 +217,7 @@ pub struct SnapArgs {
     #[arg(long)]
     pub raw: bool,
     /// Character budget; the full snapshot spills to a file beyond it
-    #[arg(long, default_value_t = 24_000)]
+    #[arg(long, default_value_t = crate::inspect::SNAP_BUDGET)]
     pub max: usize,
     /// Write the snapshot to this file instead of stdout
     #[arg(short, long)]

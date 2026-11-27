@@ -548,7 +548,6 @@ impl Page {
     }
 
     /// Follows a changed `humanize` setting.
-    #[allow(dead_code, reason = "browser.rs calls it on a config reload; drop this once that lands")]
     pub fn set_humanize(&self, humanize: Humanize) {
         *self.humanize.lock().expect("humanize lock") = humanize;
     }

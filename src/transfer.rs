@@ -114,7 +114,7 @@ async fn choose_files(page: &Page, element: &Element, paths: &[String], patience
     page.cdp.send("Page.setInterceptFileChooserDialog", json!({"enabled": true}), Some(session)).await?;
     let answered = async {
         let human = page.human();
-        crate::input::move_to(page, point, human).await?;
+        actions::reach(page, element, point, false).await?;
         crate::input::click(page, crate::cli::MouseButton::Left, 1, 0, human).await?;
         let chooser = next_signal(&mut signals, patience, |signal| match signal {
             Signal::FileChooser { backend_node_id, multiple } => Some((backend_node_id, multiple)),

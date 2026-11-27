@@ -172,16 +172,6 @@ impl Page {
         }
     }
 
-    /// [`Page::wait_for`] a page change, for at most `timeout`.
-    pub async fn wait_until(
-        &self,
-        signals: &mut broadcast::Receiver<Signal>,
-        timeout: Duration,
-        done: impl FnMut() -> bool,
-    ) -> Result<()> {
-        self.wait_for(signals, Deadline::after(timeout), "the page", done).await
-    }
-
     /// Waits until the DOM has not changed for [`QUIET`] and no document, fetch or XHR started
     /// after `since` is in flight, for at most `cap`. Earlier requests (long polls, beacons) are
     /// ignored. Returns early when a navigation or dialog starts.

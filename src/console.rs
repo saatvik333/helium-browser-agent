@@ -299,7 +299,7 @@ fn switch(page: &Page) -> Result<Option<JoinHandle<Result<()>>>> {
     }
     crate::trace!("console capture {} for {}", if want { "on" } else { "off" }, pending.as_deref().unwrap_or(&url));
     if want {
-        let target = target.context("the tab has no page right now; retry")?;
+        let target = target.ok_or(crate::page::Retry("the tab has no page right now"))?;
         let attach = page.cdp.start(
             "Target.attachToTarget",
             &json!({"targetId": target, "flatten": true}),

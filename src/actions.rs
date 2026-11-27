@@ -118,7 +118,12 @@ fn covered(label: &str, blocker: &str) -> String {
 /// Moves the pointer to `point` on `element`. A human-like path crosses other elements, and
 /// hovering one can open a menu over the target, so unless `force` the target must still take
 /// the pointer once it is there.
-async fn reach<'a>(page: &'a Page, element: &Element, point: (f64, f64), force: bool) -> Result<input::Moved<'a>> {
+pub(crate) async fn reach<'a>(
+    page: &'a Page,
+    element: &Element,
+    point: (f64, f64),
+    force: bool,
+) -> Result<input::Moved<'a>> {
     let human = page.human();
     let moved = input::move_to(page, point, human).await?;
     if human

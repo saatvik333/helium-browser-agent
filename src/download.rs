@@ -139,11 +139,11 @@ pub async fn command(cx: &mut Cx<'_>, args: DownloadArgs) -> Result<()> {
     let mut mark = page.mark();
     let mut signals = page.subscribe();
     let human = page.human();
-    crate::input::move_to(&page, point, human).await?;
+    crate::actions::reach(&page, &element, point, false).await?;
     crate::input::click(&page, MouseButton::Left, 1, 0, human).await?;
     let mut finished = None;
     let waited = page
-        .wait_until(&mut signals, cx.timeout, || {
+        .wait_for(&mut signals, crate::page::Deadline::after(cx.timeout), "the download to finish", || {
             let log = page.downloads.lock().expect("downloads lock");
             finished = log.since(mark.download_seq).find(|item| item.state != "inProgress").cloned();
             finished.is_some()

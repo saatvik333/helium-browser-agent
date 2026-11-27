@@ -247,23 +247,45 @@ impl Page {
 /// returning the last one's value (as `js` on the main frame does), then as plain statements.
 /// The code runs in an async function, so whatever it throws rejects the promise the call
 /// returns: only code that does not compile as one form is tried as the next. The split is at
-/// the last `;`: one inside a string, template or regex does not compile and falls through. A
-/// newline is no split, because the next line may continue the statement (`a\n+ b`, `f\n(x)`),
-/// and neither is a `;` behind a `//` comment on its line.
+/// the last `;` or line break that can end a statement: a `;` inside a string, template or regex
+/// does not compile and falls through. See [`ends_statement`] for line breaks.
 fn frame_functions(code: &str) -> Vec<String> {
     let wrap =
         |body: String| format!("function() {{ return (async function() {{ {body}\n }}).call(this.defaultView); }}");
     let expression = code.trim_end().trim_end_matches(';');
     let mut forms = vec![wrap(format!("return ({expression}\n);"))];
-    if let Some(split) = expression.rfind(';')
-        && !expression[split + 1..].trim().is_empty()
-        && !expression[..split].rsplit('\n').next().is_some_and(|line| line.contains("//"))
-    {
-        let (head, last) = (&expression[..=split], &expression[split + 1..]);
+    let split = expression.char_indices().rev().filter(|&(_, c)| c == ';' || c == '\n').find(|&(at, c)| {
+        let (head, tail) = (&expression[..at], &expression[at + 1..]);
+        let line = head.rsplit('\n').next().unwrap_or(head);
+        let tail_code = tail.trim();
+        !tail_code.is_empty()
+            && !tail_code.starts_with("//")
+            && !line.contains("//")
+            && (c == ';' || ends_statement(line, tail))
+    });
+    if let Some((at, _)) = split {
+        let (head, last) = (&expression[..=at], &expression[at + 1..]);
         forms.push(wrap(format!("{head}\nreturn ({last}\n);")));
     }
     forms.push(wrap(code.to_owned()));
     forms
+}
+
+/// Whether a line break between `line` and `tail` surely ends a statement, so `tail` can be
+/// returned alone. Not when `tail` continues it (`a\n+ b`, `f\n(x)`, `a\n.b`) or when `line`
+/// heads a statement that takes the next one as its body (`if (c)\nf()`, `else\nf()`):
+/// returning there would run different code instead of failing to compile.
+fn ends_statement(line: &str, tail: &str) -> bool {
+    let line = line.trim();
+    let tail = tail.trim_start();
+    let continues =
+        tail.starts_with(['+', '-', '*', '/', '%', '(', '[', '`', '.', ',', '?', ':', '=', '<', '>', '&', '|', '^']);
+    let first = line.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+    let heads = matches!(first, "if" | "for" | "while" | "else" | "do" | "with") || line.ends_with("=>");
+    !line.is_empty()
+        && !continues
+        && !heads
+        && !line.ends_with(['{', '(', '[', ',', '+', '-', '*', '/', '=', '&', '|', '?', ':'])
 }
 
 fn is_stale(error: &anyhow::Error) -> bool {
@@ -364,10 +386,15 @@ mod tests {
     #[test]
     fn frame_code_is_never_split_where_a_statement_goes_on() {
         // The next line continues the statement: returning it alone would change what runs.
-        for code in ["const t = a\n  + b", "x = y\n(z)", "x = 1; // a; b"] {
+        for code in
+            ["const t = a\n  + b", "x = y\n(z)", "x = 1; // a; b", "if (c)\nf()", "a\n.b()", "const f = x =>\nx"]
+        {
             assert_eq!(frame_functions(code).len(), 2, "{code:?} was split: {:?}", frame_functions(code));
         }
         let forms = frame_functions("const t = a\n  + b; t");
         assert!(forms[1].contains("+ b;\nreturn ( t\n);"), "{forms:?}");
+        // Lines without semicolons still give the last value, as `js` does.
+        let forms = frame_functions("const a = 1\nconst b = a + 1\nb");
+        assert!(forms[1].contains("const b = a + 1\n\nreturn (b\n);"), "{forms:?}");
     }
 }

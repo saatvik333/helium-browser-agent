@@ -1,12 +1,12 @@
 # Configuration
 
-`hba` needs no configuration when Helium uses its default data directory and `helium-browser` is
-on `PATH`. For Chrome or Brave, set `browser`. Settings come from `$XDG_CONFIG_HOME/hba/config.toml`
+`hba` needs no configuration for Helium with its default data directory and `helium-browser` on
+`PATH`. For Chrome or Brave, set `browser`. Settings come from `$XDG_CONFIG_HOME/hba/config.toml`
 (or the file named by `HBA_CONFIG`) and from `HBA_*` variables; a variable overrides the file. The
-daemon reads it again before each command: a different `browser` or `user_data_dir` reconnects, and
-`humanize` and `launcher` apply at their next use. When the browser is launched or relaunched with
-a `user_data_dir` that is not its default, `--user-data-dir` is passed; `hba browser restart` keeps
-a `--remote-debugging-port` from the old command line.
+daemon rereads them before each command: a different `browser` or `user_data_dir` reconnects, and
+`humanize` and `launcher` apply at their next use. When `hba` launches or relaunches the browser
+with a `user_data_dir` that is not its default, it passes `--user-data-dir`; `hba browser restart`
+keeps a `--remote-debugging-port` from the old command line.
 
 Everything is validated when it is read. An unknown key, a wrong type, an empty value or a bad
 variable stops the command with an error naming the file, key or variable.
@@ -70,12 +70,12 @@ to that process. Several browsers with different data directories are told apart
 debugging comes on in one of two ways:
 
 - **A flag (recommended where it works).** `--remote-debugging-port=9222` on the browser's command
-  line, for Helium and Brave in their flags file. `hba` takes the port from the process's flags
-  (port 0 from `DevToolsActivePort`, but port 0 makes `navigator.webdriver` true). Connections need
-  no approval. Helium and Brave honor the flag on any data directory. Chrome 136 and later ignores
-  it on its default data directory, and then keeps remote debugging off altogether, so do not set
-  it there; and since `chrome-flags.conf` reaches every Chrome start, pass the flag to a separate
-  `--user-data-dir` on that command line instead.
+  line: in the flags file for Helium and Brave. `hba` takes the port from the process's flags
+  (port 0 comes from `DevToolsActivePort`, but port 0 makes `navigator.webdriver` true).
+  Connections need no approval. Helium and Brave honor the flag on any data directory. Chrome 136
+  and later ignores it on its default data directory and then keeps remote debugging off
+  altogether, so do not set it there. `chrome-flags.conf` reaches every Chrome start, so pass the
+  flag on the command line of a Chrome with a separate `--user-data-dir` instead.
 - **Approval mode.** "Allow remote debugging for this browser instance" at
   `chrome://inspect/#remote-debugging` (Brave: `brave://inspect/#remote-debugging`), with no flag.
   The browser listens on a loopback port it writes to `DevToolsActivePort`, and asks its user to
@@ -104,8 +104,8 @@ never do.
 `state.json` (sessions, their tabs and which browser context is which profile). They are recreated
 as needed; deleting the directory while no daemon runs resets every session. A `state.json` that
 cannot be read is renamed to `state.json.damaged` and the daemon starts empty; no listed tab is
-closed. `files/` holds what commands write for you (screenshots, PDFs, HARs, traces, heap
-snapshots); entries older than a day are deleted when a daemon starts and whenever a new one is
-written. A `daemon.log` over 1 MiB is moved to `daemon.log.old` when a daemon starts. Without `XDG_RUNTIME_DIR`,
-`$TMPDIR/hba-UID` (`/tmp/hba-UID` by default) is used, and it must be a private (0700) directory of
-yours, not a link.
+closed. A `daemon.log` over 1 MiB is moved to `daemon.log.old` when a daemon starts. `files/` holds
+what commands write for you (screenshots, PDFs, HARs, traces, heap snapshots); entries older than
+a day are deleted when a daemon starts and whenever a new one is written. Without
+`XDG_RUNTIME_DIR`, `$TMPDIR/hba-UID` (`/tmp/hba-UID` by default) is used, and it must be a private
+(0700) directory of yours, not a link.

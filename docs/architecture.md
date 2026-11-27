@@ -5,23 +5,25 @@
 `hba` is one binary playing two roles.
 
 - **Client.** Each command is a short-lived process. It parses the arguments, reads stdin for `-`
-  arguments and `run` scripts, sends one JSON request line over `$XDG_RUNTIME_DIR/hba/hba.sock`, and
-  prints the one JSON reply line. It starts the daemon when no socket answers. `--timeout` bounds how long a command waits for a busy
-  session and for a browser it launches.
-- **Daemon.** A background `hba` with one DevTools WebSocket to the browser. It keeps sessions,
-  attached tabs, their isolated worlds and event buffers (console, network, downloads) warm, so a
-  command costs milliseconds instead of a browser connection. Commands of one session run in
-  order; different sessions run concurrently. A client that goes away (Ctrl-C, an agent's timeout)
-  cancels its command, and whatever the command switched on (interception, `Runtime`, helper tabs)
-  is switched off again; `drag`, `browser restart` and the commands that stop a recording and save
-  it run to completion. The daemon exits after `idle_minutes` (in approval mode not while it holds
-  a connection or a request awaiting Allow), on `hba daemon stop`, or when a client of a different
-  build or environment (`HBA_*`, `XDG_CONFIG_HOME`, `HOME`) connects; clients queued behind it are
-  told to retry. `daemon status` and `daemon stop` are answered by any daemon of the same build
-  whatever its environment and never start one. On the way out it stops accepting connections and
-  finishes the commands in flight, and in approval mode waits for the answer to an unanswered
-  request (up to a minute in all); a new daemon takes over as soon as the old one releases its
-  lock.
+  arguments and `run` scripts, sends one JSON request line over `$XDG_RUNTIME_DIR/hba/hba.sock`,
+  and prints the one JSON reply line. It starts the daemon when no socket answers. `--timeout`
+  bounds how long a command waits for a busy session and for a browser it launches.
+- **Daemon.** A background `hba` process holding one DevTools WebSocket to the browser. It keeps
+  sessions, attached tabs, their isolated worlds and event buffers (console, network, downloads)
+  warm, so a command costs milliseconds instead of a browser connection. Commands of one session
+  run in order; different sessions run concurrently.
+
+  A client that goes away (Ctrl-C, an agent's timeout) cancels its command, and whatever the
+  command switched on (interception, `Runtime`, helper tabs) is switched off again. `drag`,
+  `browser restart` and the commands that stop a recording and save it run to completion.
+
+  The daemon exits after `idle_minutes` (in approval mode not while it holds a connection or a
+  request awaiting Allow), on `hba daemon stop`, or when a client of a different build or
+  environment (`HBA_*`, `XDG_CONFIG_HOME`, `HOME`) connects; clients queued behind it are told to
+  retry. `daemon status` and `daemon stop` are answered by any daemon of the same build, whatever
+  its environment, and never start one. On the way out the daemon stops accepting connections and
+  finishes the commands in flight; in approval mode it also waits up to a minute for the answer to
+  an unanswered request. A new daemon takes over as soon as the old one releases its lock.
 
 ## Connecting
 
@@ -88,8 +90,9 @@ Workers and other children are released immediately.
 A session is a name (from `-s`, `HBA_SESSION`, or the project directory) with a list of tabs and a
 current tab, persisted in `$XDG_RUNTIME_DIR/hba/state.json`. A tab is in at most one session.
 Tabs a session opened are its own: `hba close` closes them. Other tabs are the user's: a session
-touches one only after `hba tab use`, which marks it adopted, and `hba close` or `hba tab release`
-detaches without closing it. Tab numbers (`t5`) are stable for the browser's lifetime.
+touches one only after `hba tab use`, which marks it adopted. `hba close` and `hba tab release`
+detach an adopted tab without closing it; `hba tab close` closes it. Tab numbers (`t5`) are stable
+for the browser's lifetime and start over when it restarts, which ends every session's ownership.
 
 ## The page engine
 

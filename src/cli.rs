@@ -6,14 +6,14 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-/// Let coding agents use your running Helium, Chrome or Brave: your profiles and logins, their own tabs.
+/// Let coding agents use your real browser (Helium, Chrome or Brave): your logins, their own tabs
 ///
 /// TARGET is a ref from `hba snap` (e5, f1e3) or a Playwright selector: css, text=Save,
 /// role=button[name="Save"], internal:label="Email", xpath=//a.
 #[derive(Debug, Parser)]
 #[command(name = "hba", version, disable_help_subcommand = true, max_term_width = 100)]
 pub struct Cli {
-    /// Task session (default: the project directory name)
+    /// Session name (default: the project's directory name)
     #[arg(short, long, global = true, env = "HBA_SESSION", value_parser = session_name, help_heading = GLOBAL)]
     pub session: Option<String>,
     /// Browser profile for new tabs: display name, directory or alias
@@ -40,15 +40,15 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(86_400);
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum Command {
-    /// Navigate the current tab (creating a tab if the session has none)
+    /// Navigate the current tab to a URL (opens a tab if the session has none)
     Open(OpenArgs),
     /// Go back in history
     Back,
     /// Go forward in history
     Forward,
-    /// Reload the page
+    /// Reload the current page
     Reload(ReloadArgs),
-    /// Accessibility snapshot with refs for acting (Playwright AI format)
+    /// Accessibility snapshot with refs to act on (Playwright AI format)
     Snap(SnapArgs),
     /// Find elements by accessible name or text; prints matching snapshot lines
     Find(FindArgs),
@@ -56,7 +56,7 @@ pub enum Command {
     Text(TextArgs),
     /// Read one property: url, title, html, inner, value, attr, count, box, style, locator
     Get(GetArgs),
-    /// Check an element state; prints true or false
+    /// Test an element's state; prints true or false
     Is(IsArgs),
     /// Screenshot the viewport, full page or an element; prints the file path
     Shot(ShotArgs),
@@ -94,7 +94,7 @@ pub enum Command {
     Dialog(DialogArgs),
     /// Click an element and save the download it starts
     Download(DownloadArgs),
-    /// Evaluate JavaScript in the page (top-level await allowed); `-` reads stdin
+    /// Evaluate JavaScript in the page (top-level await allowed)
     Js(JsArgs),
     /// Send a raw DevTools protocol command
     Cdp(CdpArgs),
@@ -102,7 +102,7 @@ pub enum Command {
     Run(RunArgs),
     /// List this session's tabs, or every tab with --all
     Tabs(TabsArgs),
-    /// Create, use (adopt), close, release or show tabs
+    /// Create, adopt, close, release or show tabs
     Tab(TabArgs),
     /// Resize, maximize, minimize or fullscreen the tab's window
     Window(WindowArgs),
@@ -120,13 +120,13 @@ pub enum Command {
     Net(NetArgs),
     /// Performance: metrics, web vitals, traces, CPU profiles, heap, coverage
     Perf(PerfArgs),
-    /// Open Chrome DevTools for the tab (for a human)
+    /// Open DevTools for the tab, for the user to watch
     Devtools(DevtoolsArgs),
     /// Emulate device, viewport, locale, timezone, geolocation, media, network or CPU
     Emulate(EmulateArgs),
     /// Read and change cookies
     Cookies(CookiesArgs),
-    /// Read and change localStorage or sessionStorage of the page's origin
+    /// Read and change localStorage or sessionStorage of the page's origin (no subcommand lists every key)
     Storage(StorageArgs),
     /// Save or load cookies and storage to a JSON file
     State(StateArgs),
@@ -167,7 +167,7 @@ pub struct OpenArgs {
     /// Show the tab to the user (activates it in its window)
     #[arg(long)]
     pub front: bool,
-    /// When to return
+    /// Load state to wait for before returning
     #[arg(long, value_enum, default_value_t = LoadState::Dom)]
     pub wait: LoadState,
 }
@@ -463,7 +463,7 @@ pub struct MouseArgs {
     /// Button for down, up and click
     #[arg(long, value_enum, default_value_t = MouseButton::Left)]
     pub button: MouseButton,
-    /// Wheel delta for `wheel` (dy, or dx with --horizontal)
+    /// Vertical wheel delta in pixels for `wheel` (positive scrolls down)
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub delta: f64,
 }
@@ -481,7 +481,7 @@ pub enum MouseAction {
 pub struct WaitArgs {
     /// Milliseconds (at most a day), or an element to wait for
     pub what: Option<String>,
-    /// With an element: wait until it is gone/hidden instead
+    /// With an element: wait until it is gone or hidden instead
     #[arg(long)]
     pub gone: bool,
     /// Wait until the page shows this text
@@ -539,7 +539,7 @@ pub struct JsArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct CdpArgs {
-    /// Domain.method
+    /// DevTools method, as Domain.method
     pub method: String,
     /// JSON parameters; `-` reads stdin
     pub params: Option<String>,
@@ -562,7 +562,7 @@ pub struct RunArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct TabsArgs {
-    /// Every tab of every open profile, in tab-strip order
+    /// List every tab of every open profile, in tab-strip order
     #[arg(short, long)]
     pub all: bool,
 }
@@ -577,23 +577,37 @@ pub struct TabArgs {
 pub enum TabOp {
     /// Open a new session tab and make it current
     New {
+        /// URL to open in it; a bare host gets https://
         url: Option<String>,
+        /// Show the tab to the user (activates it in its window)
         #[arg(long)]
         front: bool,
     },
-    /// Make a tab current; a tab the session doesn't own is adopted (from `hba tabs --all`)
-    Use { id: String },
-    /// Close a session tab, adopted ones too (default: the current one); `hba close` only releases those
-    Close { id: Option<String> },
+    /// Make a tab current; adopts a tab the session doesn't own (find it with `hba tabs --all`)
+    Use {
+        /// Tab number, e.g. t5
+        id: String,
+    },
+    /// Close a session tab, adopted ones too (default: the current tab); `hba close` only releases adopted tabs
+    Close {
+        /// Tab number (default: the current tab)
+        id: Option<String>,
+    },
     /// Stop controlling an adopted tab; it stays open
-    Release { id: Option<String> },
+    Release {
+        /// Tab number (default: the current tab)
+        id: Option<String>,
+    },
     /// Show the tab to the user (activates it in its window)
-    Front { id: Option<String> },
+    Front {
+        /// Tab number (default: the current tab)
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct WindowArgs {
-    /// What to do with the window
+    /// Window state, or `size` to resize it
     #[arg(value_enum)]
     pub state: WindowState,
     /// New size, for `size`
@@ -659,7 +673,7 @@ pub struct ErrorsArgs {
 pub struct NetArgs {
     #[command(subcommand)]
     pub op: Option<NetOp>,
-    /// Only URLs containing this
+    /// Only URLs containing this text
     #[arg(short, long)]
     pub filter: Option<String>,
     /// Only this resource type: document, xhr, fetch, script, stylesheet, image, font, media, websocket, other
@@ -717,7 +731,7 @@ pub enum NetOp {
         #[arg(long = "header")]
         headers: Vec<String>,
     },
-    /// Remove blocking/mocking rules (all when no pattern)
+    /// Remove block and mock rules (all if no pattern)
     Unroute {
         /// Rule pattern to remove
         pattern: Option<String>,
@@ -747,7 +761,7 @@ pub struct PerfArgs {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum PerfOp {
-    /// Chrome performance metrics (layout, script, heap, nodes)
+    /// Performance metrics (layout, script, heap, nodes)
     Metrics,
     /// Web vitals from buffered entries: TTFB, FCP, LCP, CLS, INP
     Vitals,
@@ -782,7 +796,7 @@ pub enum PerfOp {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct DevtoolsArgs {
-    /// elements, console, network, sources, resources, timeline, lighthouse, security
+    /// Panel to open: elements, console, network, sources, resources, timeline, lighthouse, security
     pub panel: Option<String>,
 }
 
@@ -803,22 +817,22 @@ pub struct EmulateArgs {
     /// User agent string (client hints follow it)
     #[arg(long)]
     pub ua: Option<String>,
-    /// Language, e.g. en-US
+    /// Locale, e.g. en-US
     #[arg(long)]
     pub locale: Option<String>,
     /// IANA timezone, e.g. Asia/Kolkata
     #[arg(long)]
     pub tz: Option<String>,
-    /// LATITUDE,LONGITUDE
+    /// Geolocation as LATITUDE,LONGITUDE
     #[arg(long, value_parser = parse_point, allow_hyphen_values = true)]
     pub geo: Option<(f64, f64)>,
-    /// prefers-color-scheme
+    /// Color scheme (prefers-color-scheme)
     #[arg(long, value_enum)]
     pub scheme: Option<ColorScheme>,
     /// CSS media type
     #[arg(long, value_enum)]
     pub media: Option<MediaType>,
-    /// prefers-reduced-motion: reduce
+    /// Set prefers-reduced-motion to reduce
     #[arg(long)]
     pub reduced_motion: bool,
     /// Network conditions
@@ -892,7 +906,7 @@ pub enum CookiesOp {
         #[arg(long)]
         expires: Option<f64>,
     },
-    /// Delete cookies by name for the page's origin or --url
+    /// Delete cookies with this name for the page's origin or --url
     Rm {
         /// Cookie name
         name: String,
@@ -903,7 +917,7 @@ pub enum CookiesOp {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct StorageArgs {
-    /// Which storage of the page's origin
+    /// Storage area of the page's origin
     #[arg(value_enum, default_value_t = StorageArea::Local)]
     pub area: StorageArea,
     #[command(subcommand)]
@@ -918,7 +932,7 @@ pub enum StorageArea {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum StorageOp {
-    /// Print one key's value (default: list every key)
+    /// Print one key's value
     Get {
         /// Storage key
         key: String,
@@ -941,8 +955,7 @@ pub enum StorageOp {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct StateArgs {
-    /// Save the page site's cookies and storage, or load them back: load replaces the site's
-    /// cookies and each storage area the file lists; areas it doesn't list are left alone
+    /// Save the page site's cookies and storage to the file, or load them back
     #[arg(value_enum)]
     pub action: SaveLoad,
     /// State file (Playwright storage-state format)
@@ -971,7 +984,7 @@ pub enum PermsOp {
         /// Permission names
         #[arg(required = true)]
         permissions: Vec<String>,
-        /// Origin (default: the page's)
+        /// Origin (default: the page's origin)
         #[arg(long)]
         origin: Option<String>,
     },
@@ -987,7 +1000,7 @@ pub struct ExtArgs {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum ExtOp {
-    /// Install an unpacked extension directory into the active profile (until browser restart)
+    /// Install an unpacked extension directory into the last-used profile (until the browser restarts)
     Load {
         /// Unpacked extension directory (with manifest.json)
         dir: PathBuf,
@@ -1050,11 +1063,11 @@ pub enum ExtOp {
         #[command(subcommand)]
         op: Option<StorageOp>,
     },
-    /// Service worker: status, start or stop
+    /// Show an extension's service worker state, or start or stop it
     Sw {
         /// Extension id, unpacked directory, or (part of) its name
         ext: String,
-        /// Show the worker's state, or start or stop it
+        /// Action to take
         #[arg(value_enum, default_value_t = SwAction::Status)]
         action: SwAction,
     },
@@ -1077,7 +1090,7 @@ pub enum SwAction {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct ClipArgs {
-    /// Text to copy; `-` reads stdin. Omit to print the clipboard.
+    /// Text to copy; `-` reads stdin (omit to print the clipboard)
     pub text: Option<String>,
 }
 
@@ -1089,7 +1102,7 @@ pub struct BrowserArgs {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum BrowserOp {
-    /// Start the browser with a profile if it is not running
+    /// Start the browser if it is not running
     Launch,
     /// Quit and relaunch the browser, restoring every open profile's tabs
     Restart,

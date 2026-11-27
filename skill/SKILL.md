@@ -24,7 +24,7 @@ hba close                       # when done: closes your tabs, releases adopted 
   coordinates. Long output spills to a file; files are deleted after a day.
 - Read: `hba find 'checkout'` (elements by text or name), `hba text [e40]`,
   `hba get url|title|value|attr|html|inner|count|box|style|locator TARGET` (`locator`: a stable
-  selector), `hba is visible|enabled|checked|editable|focused TARGET`.
+  selector), `hba is visible|enabled|checked|editable|focused TARGET` (prints true or false).
 
 ## Acting
 `click` (`--count 2`, `--button right`, `--modifiers Control`), `hover`, `focus`, `fill` (`--submit`
@@ -90,7 +90,8 @@ checks). `click`, `fill` and `press` take `-d` for a snapshot diff.
 ## Rules
 - Input is real. Don't use JS shortcuts (`element.click()` via `js`) when a real action exists:
   they look automated.
-- Exit code 1 = failed, 2 = bad usage.
+- Errors say what to run next (re-snap, answer a dialog, adopt a tab). Exit code 1 = failed,
+  2 = bad usage.
 - Login walls, MFA, captchas, purchases and anything irreversible: stop and ask the user.
 - `hba doctor` for connection problems; `hba browser launch|restart|endpoint`.
 - **Approval mode** (Chrome's own profile): on "did not allow the DevTools connection … click

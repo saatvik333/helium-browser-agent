@@ -21,7 +21,7 @@ hba close                             # closes the tabs this session opened
 - **Your tabs stay yours.** An agent can act only on tabs it opened, or on one you hand it with
   `hba tab use t42`. `hba tab release` gives that tab back.
 - **Milliseconds per command.** A small background process keeps one connection open. With hba
-  0.2.0 on Helium (52 open tabs, example.com), `get url` and `text` took 7–11 ms and `snap` 9–14 ms
+  0.2.0 on Helium (52 open tabs, example.com), `get url` and `text` took 2–3 ms and `snap` 2–4 ms
   after the first call, client process included ([more timings](docs/architecture.md#performance)).
 - **Acts like a person on websites.** Clicks, keystrokes and single-choice `select` are real
   input events, with human pacing on websites; only date, time, color and range fields and

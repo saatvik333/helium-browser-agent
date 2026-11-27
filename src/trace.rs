@@ -1,10 +1,12 @@
-//! Opt-in timing trace for the daemon log: set `HBA_TRACE=1` when starting the daemon.
+//! Opt-in timing trace for the daemon log: set `HBA_TRACE=1` when starting the daemon. It names
+//! commands, never their arguments, which can hold typed text and secrets.
 
 use std::sync::LazyLock;
 use std::time::Instant;
 
 pub static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("HBA_TRACE").is_some_and(|v| v != "0"));
 
+/// When the daemon started; forced first thing in [`crate::daemon::main`].
 pub static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Writes `format!(...)` with milliseconds since daemon start to stderr (the daemon log).

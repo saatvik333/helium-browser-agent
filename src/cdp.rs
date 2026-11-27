@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -40,11 +40,19 @@ impl Event {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProtocolError {
     pub message: String,
+    /// Chromium's detail, e.g. which parameter failed to deserialize.
+    #[serde(default)]
+    pub data: Option<Value>,
 }
 
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        match &self.data {
+            None => Ok(()),
+            Some(Value::String(data)) => write!(f, ": {data}"),
+            Some(data) => write!(f, ": {data}"),
+        }
     }
 }
 
@@ -64,6 +72,8 @@ struct Inner {
     routes: Mutex<HashMap<Arc<str>, mpsc::UnboundedSender<Event>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    /// Set by [`Cdp::close`]; ends the socket's reading and writing tasks.
+    stop: watch::Sender<bool>,
 }
 
 #[derive(Serialize)]
@@ -104,27 +114,46 @@ impl Cdp {
             routes: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            stop: watch::channel(false).0,
         });
+        let mut stopped = inner.stop.subscribe();
         tokio::spawn(async move {
-            while let Some(text) = queue.recv().await {
-                if sink.send(Message::text(text)).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    text = queue.recv() => {
+                        let Some(text) = text else { break };
+                        if sink.send(Message::text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = stopped.changed() => break,
                 }
             }
             let _ = sink.close().await;
         });
         let reader = Arc::clone(&inner);
+        let mut stopped = inner.stop.subscribe();
         tokio::spawn(async move {
-            while let Some(Ok(message)) = stream.next().await {
-                match message {
-                    Message::Text(text) => reader.dispatch(text.as_str(), &browser_tx),
-                    Message::Close(_) => break,
-                    _ => {}
+            loop {
+                tokio::select! {
+                    message = stream.next() => match message {
+                        Some(Ok(Message::Text(text))) => reader.dispatch(text.as_str(), &browser_tx),
+                        Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    },
+                    _ = stopped.changed() => break,
                 }
             }
             reader.shut_down();
         });
         Ok((Self { inner }, browser_rx))
+    }
+
+    /// Closes the connection: calls in flight fail, routed event streams and the browser-level
+    /// event stream end.
+    pub fn close(&self) {
+        self.inner.shut_down();
+        self.inner.stop.send_replace(true);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -274,5 +303,124 @@ impl Inner {
         // Dropping the senders fails every waiter and ends every routed event stream.
         self.pending.lock().expect("pending lock").clear();
         self.routes.lock().expect("routes lock").clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::WebSocketStream;
+
+    /// The browser end of a connection, played by the test.
+    type Browser = WebSocketStream<TcpStream>;
+
+    async fn connected() -> (Cdp, mpsc::UnboundedReceiver<Event>, Browser) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}/devtools/browser/test", listener.local_addr().expect("address"));
+        let accept = async {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio_tungstenite::accept_async(stream).await.expect("handshake")
+        };
+        let (client, browser) = tokio::join!(Cdp::connect(&url), accept);
+        let (cdp, events) = client.expect("connect");
+        (cdp, events, browser)
+    }
+
+    /// The id of the next command the browser receives.
+    async fn command(browser: &mut Browser) -> u64 {
+        loop {
+            if let Message::Text(text) = browser.next().await.expect("a message").expect("a frame") {
+                let command: Value = serde_json::from_str(text.as_str()).expect("JSON");
+                return command["id"].as_u64().expect("an id");
+            }
+        }
+    }
+
+    async fn send(browser: &mut Browser, message: &Value) {
+        browser.send(Message::text(message.to_string())).await.expect("send");
+    }
+
+    #[tokio::test]
+    async fn replies_reach_their_callers_in_any_order() {
+        let (cdp, _events, mut browser) = connected().await;
+        let first = cdp.start("A.one", &json!({}), None, CALL_TIMEOUT).expect("send one");
+        let second = cdp.start("A.two", &json!({}), None, CALL_TIMEOUT).expect("send two");
+        let (one, two) = (command(&mut browser).await, command(&mut browser).await);
+        send(&mut browser, &json!({"id": two, "result": {"n": 2}})).await;
+        send(&mut browser, &json!({"id": one, "result": {"n": 1}})).await;
+        assert_eq!(first.await.expect("one").get(), r#"{"n":1}"#);
+        assert_eq!(second.await.expect("two").get(), r#"{"n":2}"#);
+    }
+
+    #[tokio::test]
+    async fn a_protocol_error_keeps_chromiums_detail() {
+        let (cdp, _events, mut browser) = connected().await;
+        let refuse = async {
+            let id = command(&mut browser).await;
+            let error = json!({"code": -32602, "message": "Invalid parameters", "data": "Failed to deserialize params.targetId"});
+            send(&mut browser, &json!({"id": id, "error": error})).await;
+        };
+        let (outcome, ()) = tokio::join!(cdp.raw("Target.attachToTarget", json!({}), None), refuse);
+        let error = format!("{:#}", outcome.expect_err("the browser refused"));
+        assert_eq!(error, "Target.attachToTarget: Invalid parameters: Failed to deserialize params.targetId");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_call_leaves_nothing_pending() {
+        let (cdp, _events, _browser) = connected().await;
+        let error =
+            cdp.raw_within("Page.slow", json!({}), None, Duration::from_millis(20)).await.expect_err("no answer");
+        assert_eq!(error.to_string(), "Page.slow timed out after 0.02s");
+        drop(cdp.start("Page.dropped", &json!({}), None, CALL_TIMEOUT).expect("send"));
+        assert!(cdp.inner.pending.lock().expect("pending lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_fails_the_calls_waiting_on_it() {
+        let (cdp, _events, mut browser) = connected().await;
+        let crash = async move {
+            command(&mut browser).await;
+        };
+        let (outcome, ()) = tokio::join!(cdp.raw("Page.navigate", json!({}), None), crash);
+        let error = outcome.expect_err("the browser went away").to_string();
+        assert_eq!(error, "Page.navigate: the connection to the browser closed");
+        assert!(cdp.is_closed());
+        assert!(cdp.raw("Page.reload", json!({}), None).await.is_err(), "later calls fail at once");
+    }
+
+    #[tokio::test]
+    async fn events_reach_the_route_of_their_session() {
+        let (cdp, mut browser_events, mut browser) = connected().await;
+        let (route, mut routed) = mpsc::unbounded_channel();
+        cdp.route("S1", route);
+        send(&mut browser, &json!({"method": "Page.loadEventFired", "sessionId": "S1", "params": {"t": 1}})).await;
+        send(&mut browser, &json!({"method": "Page.loadEventFired", "sessionId": "S2", "params": {"t": 2}})).await;
+        send(&mut browser, &json!({"method": "Target.targetCreated", "params": {"t": 3}})).await;
+        let event = routed.recv().await.expect("the event of S1");
+        assert_eq!((event.session.as_deref(), event.params.get()), (Some("S1"), r#"{"t":1}"#));
+        let event = browser_events.recv().await.expect("the browser's event");
+        assert_eq!((event.method.as_str(), event.params.get()), ("Target.targetCreated", r#"{"t":3}"#));
+        cdp.unroute("S1");
+        assert!(routed.recv().await.is_none(), "the event of S2, which has no route, went nowhere");
+    }
+
+    #[tokio::test]
+    async fn closing_ends_the_connection_and_its_calls() {
+        let (cdp, mut browser_events, mut browser) = connected().await;
+        let call = cdp.start("Page.navigate", &json!({}), None, CALL_TIMEOUT).expect("send");
+        command(&mut browser).await;
+        cdp.close();
+        assert!(cdp.is_closed());
+        let error = call.await.expect_err("closed").to_string();
+        assert_eq!(error, "Page.navigate: the connection to the browser closed");
+        assert!(browser_events.recv().await.is_none(), "the browser-level events end");
+        loop {
+            match browser.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
     }
 }

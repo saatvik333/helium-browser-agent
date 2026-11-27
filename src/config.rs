@@ -237,6 +237,17 @@ impl Config {
         self.workspaces.iter().find(|(dir, _)| cwd.starts_with(dir)).map(|(_, profile)| profile.as_str())
     }
 
+    /// Whether `user_data_dir` is the browser's default one, which its launcher uses unless told
+    /// otherwise.
+    pub fn uses_default_data_dir(&self) -> bool {
+        self.default_data_dir
+    }
+
+    /// Whether `other` names the same browser instance: a connection made for one serves the other.
+    pub fn same_browser(&self, other: &Config) -> bool {
+        self.browser == other.browser && self.user_data_dir == other.user_data_dir && self.cdp_url == other.cdp_url
+    }
+
     /// Whether the browser ignores `--remote-debugging-port`: Chrome 136 and later does on its
     /// default user data directory, and then starts no DevTools server at all, not even the one
     /// its remote debugging switch turns on.
@@ -379,5 +390,14 @@ mod tests {
         assert!(!brave.ignores_port_flag());
         let error = config("browser = 'firefox'").unwrap_err().to_string();
         assert!(error.contains("expected one of `helium`, `chrome`, `brave`"), "{error}");
+    }
+
+    #[test]
+    fn only_the_browser_and_its_data_dir_make_another_instance() {
+        let base = config("user_data_dir = '/srv/a'").unwrap();
+        let tuned = config("user_data_dir = '/srv/a'\nhumanize = 'never'\nlauncher = '/srv/other'").unwrap();
+        assert!(base.same_browser(&tuned), "input timing and the launcher are read at use");
+        assert!(!base.same_browser(&config("user_data_dir = '/srv/b'").unwrap()));
+        assert!(!base.same_browser(&config("browser = 'brave'\nuser_data_dir = '/srv/a'").unwrap()));
     }
 }

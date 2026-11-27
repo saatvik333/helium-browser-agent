@@ -56,7 +56,10 @@ pub async fn run(cx: &mut Cx<'_>, command: Command) -> Result<()> {
         Command::Ext(args) => crate::extensions::ext(cx, args.op).await,
         Command::Clip(args) => crate::clip::clip(cx, args).await,
         Command::Browser(args) => crate::system::browser(cx, args.op).await,
-        Command::Daemon(args) => crate::system::daemon(cx, args.op).await,
+        Command::Daemon(args) => {
+            crate::system::daemon(cx, args.op);
+            Ok(())
+        }
         Command::Doctor => crate::system::doctor(cx).await,
     }
 }

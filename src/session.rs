@@ -46,6 +46,11 @@ impl Session {
             self.current = self.tabs.last().map(|t| t.id.clone());
         }
     }
+
+    /// Holds nothing worth keeping: no tabs and no profile choice.
+    fn is_empty(&self) -> bool {
+        self.profile.is_none() && self.tabs.is_empty() && self.current.is_none()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -63,6 +68,10 @@ pub struct Store {
     pub sessions: BTreeMap<String, Session>,
     #[serde(skip)]
     path: PathBuf,
+    /// Changed since it was last saved: tab numbers are handed out by reads too, and must
+    /// survive the daemon.
+    #[serde(skip)]
+    changed: bool,
 }
 
 impl Store {
@@ -82,7 +91,7 @@ impl Store {
     }
 
     /// Writes the store atomically, readable only by the user.
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let tmp = self.path.with_extension("json.tmp");
@@ -94,7 +103,14 @@ impl Store {
             .open(&tmp)
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.write_all(&serde_json::to_vec(self)?).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))
+        std::fs::rename(&tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))?;
+        self.changed = false;
+        Ok(())
+    }
+
+    /// Saves what changed since the last save, if anything did.
+    pub fn save_changes(&mut self) -> Result<()> {
+        if self.changed { self.save() } else { Ok(()) }
     }
 
     /// Switches to a new browser run, forgetting ids from the previous one.
@@ -108,6 +124,7 @@ impl Store {
                 session.tabs.clear();
                 session.current = None;
             }
+            self.changed = true;
         }
     }
 
@@ -122,6 +139,7 @@ impl Store {
         }
         self.next_number += 1;
         self.numbers.insert(tab.to_owned(), self.next_number);
+        self.changed = true;
         self.next_number
     }
 
@@ -150,15 +168,21 @@ impl Store {
         self.sessions.iter().find(|(_, session)| session.owns(tab)).map(|(name, _)| name.as_str())
     }
 
-    /// Forgets tabs that no longer exist.
+    /// Forgets tabs that no longer exist, and sessions left holding nothing.
     pub fn prune(&mut self, live: &[String]) {
+        let before = (self.numbers.len(), self.sessions.len());
         for session in self.sessions.values_mut() {
+            let tabs = session.tabs.len();
             session.tabs.retain(|tab| live.contains(&tab.id));
             if session.current.as_ref().is_some_and(|current| !live.contains(current)) {
                 session.current = session.tabs.last().map(|tab| tab.id.clone());
+                self.changed = true;
             }
+            self.changed |= session.tabs.len() != tabs;
         }
         self.numbers.retain(|id, _| live.contains(id));
+        self.sessions.retain(|_, session| !session.is_empty());
+        self.changed |= before != (self.numbers.len(), self.sessions.len());
     }
 }
 
@@ -213,5 +237,31 @@ mod tests {
         store.prune(&["A".to_owned()]);
         assert_eq!(store.sessions["s"].tabs, [Tab { id: "A".into(), adopted: false }]);
         assert_eq!(store.sessions["s"].current.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn pruning_drops_sessions_left_with_nothing() {
+        let mut store = Store::default();
+        store.session("gone").add("A", false);
+        store.session("kept").profile = Some("Default".into());
+        store.prune(&[]);
+        assert_eq!(store.sessions.keys().collect::<Vec<_>>(), ["kept"], "its profile choice is kept");
+    }
+
+    #[test]
+    fn numbers_handed_out_by_reads_are_saved() {
+        let dir = std::env::temp_dir().join(format!("hba-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("state.json");
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::load(path.clone());
+        store.save_changes().expect("save");
+        assert!(!path.exists(), "nothing changed, nothing written");
+        store.number("AAA");
+        store.save_changes().expect("save");
+        let mut loaded = Store::load(path.clone());
+        assert_eq!(loaded.number("BBB"), 2, "AAA kept its number");
+        assert_eq!(loaded.resolve_tab("t1", &[]).expect("t1"), "AAA");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

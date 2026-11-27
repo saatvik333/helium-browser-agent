@@ -11,6 +11,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -134,7 +135,7 @@ pub fn discover(config: &Config) -> Result<Endpoint> {
 }
 
 /// The `--remote-debugging-port` a process was started with; the last one counts, as in Chromium.
-fn flag_port(pid: u32) -> Option<u16> {
+pub fn flag_port(pid: u32) -> Option<u16> {
     switches(pid).iter().rev().find_map(|arg| arg.strip_prefix("--remote-debugging-port="))?.parse().ok()
 }
 
@@ -166,25 +167,30 @@ fn version_url(port: u16) -> Result<String> {
             bail!("{}: the connection closed early", fail());
         }
         response.extend_from_slice(&chunk[..read]);
-        let text = String::from_utf8_lossy(&response);
-        if let Some((head, body)) = text.split_once("\r\n\r\n") {
-            let length = head
-                .lines()
-                .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .with_context(fail)?;
-            if body.len() >= length {
-                break body[..length].to_owned();
-            }
+        if let Some(body) = body_range(&response).with_context(fail)? {
+            break body;
         }
     };
-    let version: serde_json::Value = serde_json::from_str(&body).with_context(fail)?;
+    let version: serde_json::Value = serde_json::from_slice(&response[body]).with_context(fail)?;
     let url = version["webSocketDebuggerUrl"].as_str().with_context(fail)?;
     let path = url
         .strip_prefix(&format!("ws://127.0.0.1:{port}"))
         .with_context(|| format!("unexpected DevTools URL {url}"))?;
     parse_active_port(&format!("{port}\n{path}")).with_context(|| format!("unexpected DevTools URL {url}"))?;
     Ok(url.to_owned())
+}
+
+/// Where the body of an HTTP response is, once all its `Content-Length` bytes arrived.
+fn body_range(response: &[u8]) -> Result<Option<std::ops::Range<usize>>> {
+    let Some(end) = response.windows(4).position(|window| window == b"\r\n\r\n") else { return Ok(None) };
+    let head = std::str::from_utf8(&response[..end]).context("the response head is not text")?;
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .context("the response has no Content-Length")?;
+    let start = end + 4;
+    Ok((response.len() - start >= length).then_some(start..start + length))
 }
 
 fn id_of(url: &str) -> &str {
@@ -288,7 +294,15 @@ pub fn switch_on(config: &Config) -> bool {
 /// Starts the launcher detached, e.g. to open a profile window or start the browser. The
 /// process is reaped when it exits, so a browser hba started can be seen to quit.
 pub fn launch(config: &Config, args: &[String]) -> Result<()> {
-    let mut child = std::process::Command::new(&config.launcher)
+    let mut command = std::process::Command::new(&config.launcher);
+    // The browser's singleton is its data directory: without the flag, the launcher starts or
+    // reaches the instance on the default one.
+    if !config.uses_default_data_dir() {
+        let mut flag = std::ffi::OsString::from("--user-data-dir=");
+        flag.push(&config.user_data_dir);
+        command.arg(flag);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -300,31 +314,41 @@ pub fn launch(config: &Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Starts the browser when it is not running and waits for a verified endpoint.
-pub async fn ensure_running(config: &Config, profile_dir: Option<&str>) -> Result<Endpoint> {
-    if let Ok(endpoint) = discover(config) {
-        return Ok(endpoint);
-    }
-    if config.cdp_url.is_some() || running(config) {
-        // A running browser whose endpoint fails verification is never second-guessed.
-        return discover(config);
+/// [`discover`] off the runtime thread: it reads `/proc` and may wait a second for `/json/version`.
+pub async fn discover_off_thread(config: &Arc<Config>) -> Result<Endpoint> {
+    let config = Arc::clone(config);
+    tokio::task::spawn_blocking(move || discover(&config)).await.context("finding the DevTools endpoint")?
+}
+
+/// Starts the browser when it is not running and waits until `deadline` for a verified endpoint.
+pub async fn ensure_running(
+    config: &Arc<Config>,
+    profile_dir: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<Endpoint> {
+    let found = discover_off_thread(config).await;
+    // A running browser whose endpoint fails verification is never second-guessed.
+    if found.is_ok() || config.cdp_url.is_some() || running(config) {
+        return found;
     }
     let mut args = Vec::new();
     if let Some(dir) = profile_dir {
         args.push(format!("--profile-directory={dir}"));
     }
     launch(config, &args)?;
+    let started = tokio::time::Instant::now();
     // Verification rejects anything left over from an earlier run (a stale port file or port).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        match discover(config) {
+        match discover_off_thread(config).await {
             Ok(endpoint) => return Ok(endpoint),
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 let name = config.browser.name();
-                return Err(
-                    error.context(format!("{name} started but its DevTools endpoint did not appear within 20s"))
-                );
+                return Err(error.context(format!(
+                    "{name} started but its DevTools endpoint did not appear within {:.1}s; run the command again, \
+                     with a longer --timeout if {name} starts slowly",
+                    started.elapsed().as_secs_f32()
+                )));
             }
             Err(_) => {}
         }
@@ -353,5 +377,16 @@ mod tests {
         // Chrome on its default data dir ignores the flag and starts no server at all.
         assert_eq!(plan(Some(9222), true), Plan::Ignored);
         assert_eq!(plan(Some(0), true), Plan::Ignored);
+    }
+
+    #[test]
+    fn a_response_body_is_complete_after_content_length_bytes() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\naé".as_bytes();
+        // A character split between reads: one byte of it is missing.
+        assert_eq!(body_range(&response[..response.len() - 1]).expect("valid head"), None);
+        let body = body_range(response).expect("valid head").expect("complete");
+        assert_eq!(&response[body], "aé".as_bytes());
+        assert_eq!(body_range(b"HTTP/1.1 200 OK\r\n").expect("no head yet"), None);
+        assert!(body_range(b"HTTP/1.1 200 OK\r\n\r\n{}").is_err(), "no Content-Length");
     }
 }

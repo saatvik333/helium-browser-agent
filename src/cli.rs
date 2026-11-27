@@ -54,7 +54,7 @@ pub enum Command {
     Find(FindArgs),
     /// Visible text of the page or an element
     Text(TextArgs),
-    /// Read one property: url, title, html, value, attr, count, box, style, locator
+    /// Read one property: url, title, html, inner, value, attr, count, box, style, locator
     Get(GetArgs),
     /// Check an element state; prints true or false
     Is(IsArgs),
@@ -226,7 +226,7 @@ pub struct SnapArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct FindArgs {
-    /// Text to look for (case-insensitive), or /regex/
+    /// Text to look for (case-insensitive)
     pub query: String,
     /// Only this ARIA role
     #[arg(long)]
@@ -251,7 +251,7 @@ pub struct GetArgs {
     pub target: Option<String>,
     /// Attribute or CSS property name for attr and style
     pub name: Option<String>,
-    /// Character budget for html
+    /// Character budget for html and inner
     #[arg(long, default_value_t = 12_000)]
     pub max: usize,
 }
@@ -941,7 +941,8 @@ pub enum StorageOp {
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct StateArgs {
-    /// Save the page site's cookies and storage, or load them back
+    /// Save the page site's cookies and storage, or load them back: load replaces the site's
+    /// cookies and each storage area the file lists; areas it doesn't list are left alone
     #[arg(value_enum)]
     pub action: SaveLoad,
     /// State file (Playwright storage-state format)
@@ -950,7 +951,10 @@ pub struct StateArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum SaveLoad {
+    /// Write the site's cookies and storage to the file
     Save,
+    /// Replace the site's cookies and each storage area the file lists; areas it doesn't list
+    /// are left alone
     Load,
 }
 

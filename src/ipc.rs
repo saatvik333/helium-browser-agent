@@ -20,8 +20,9 @@ pub const DAEMON_ARG: &str = "__hba-daemon";
 pub const DAEMON_DRAIN: Duration = Duration::from_secs(60);
 
 /// Variables the daemon reads once when it starts. A client whose values differ gets a fresh
-/// daemon instead of one that would silently ignore them.
-const DAEMON_ENV: [&str; 8] = [
+/// daemon instead of one that would silently ignore them. `HOME` places `~/` paths and the XDG
+/// directories that are not set.
+const DAEMON_ENV: [&str; 9] = [
     "HBA_CONFIG",
     "HBA_BROWSER",
     "HBA_USER_DATA_DIR",
@@ -30,6 +31,7 @@ const DAEMON_ENV: [&str; 8] = [
     "HBA_CDP",
     "HBA_TRACE",
     "XDG_CONFIG_HOME",
+    "HOME",
 ];
 
 /// This process's values of [`DAEMON_ENV`], as one comparable string.
@@ -51,12 +53,30 @@ pub struct Request {
     pub command: Command,
 }
 
+/// What every build reads from a request before the rest: a daemon of another build may not
+/// know the command (a subcommand added since), and must still answer [`Reply::Restart`].
+#[derive(Debug, Deserialize)]
+pub struct Header {
+    pub build: String,
+}
+
+/// The reply line. Its format must stay the same across builds: a client of one build reads
+/// the [`Reply::Restart`] of a daemon from another.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     /// Normal completion; `code` is the process exit status.
     Done { stdout: String, stderr: String, code: u8 },
     /// The daemon is from another build or environment and is exiting; start a fresh one and retry.
     Restart,
+}
+
+impl Reply {
+    /// The reply as the line the daemon sends.
+    pub fn line(&self) -> String {
+        let mut text = serde_json::to_string(self).expect("a reply serializes");
+        text.push('\n');
+        text
+    }
 }
 
 /// Private per-user runtime directory (`$XDG_RUNTIME_DIR/hba`), created with mode 0700.
@@ -96,4 +116,43 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
 
 pub fn socket_path(runtime: &Path) -> PathBuf {
     runtime.join("hba.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{DaemonArgs, DaemonOp};
+
+    fn request(command: Command) -> Request {
+        Request {
+            build: BUILD.to_owned(),
+            env: daemon_env(),
+            cwd: PathBuf::from("/"),
+            session: None,
+            profile: None,
+            tab: None,
+            json: false,
+            timeout_secs: None,
+            command,
+        }
+    }
+
+    #[test]
+    fn the_header_of_a_request_with_an_unknown_command_still_reads() {
+        let mut value = serde_json::to_value(request(Command::Daemon(DaemonArgs { op: DaemonOp::Status })))
+            .expect("serialize the request");
+        value["build"] = "0.0.0+other".into();
+        value["command"] = serde_json::json!({"Teleport": {"to": "mars"}});
+        let line = value.to_string();
+        assert!(serde_json::from_str::<Request>(&line).is_err(), "this build does not know the command");
+        let header: Header = serde_json::from_str(&line).expect("the header reads");
+        assert_eq!(header.build, "0.0.0+other");
+    }
+
+    #[test]
+    fn the_reply_line_has_one_format_for_every_build() {
+        assert_eq!(Reply::Restart.line(), "\"Restart\"\n");
+        let done = Reply::Done { stdout: "a".into(), stderr: String::new(), code: 2 };
+        assert_eq!(done.line(), "{\"Done\":{\"stdout\":\"a\",\"stderr\":\"\",\"code\":2}}\n");
+    }
 }

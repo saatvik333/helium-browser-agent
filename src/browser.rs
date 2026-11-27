@@ -62,7 +62,8 @@ pub struct Browser {
     pub endpoint: Endpoint,
     /// e.g. `Chrome/156.0.8078.73`.
     pub product: String,
-    config: Arc<Config>,
+    /// The configuration as last loaded: input timing and the launcher are read from it at use.
+    config: Mutex<Arc<Config>>,
     /// Browser context id → profile directory, learned from tabs this daemon identified.
     contexts: Mutex<HashMap<String, String>>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
@@ -105,7 +106,7 @@ impl Browser {
             cdp,
             endpoint,
             product: version.product,
-            config,
+            config: Mutex::new(config),
             contexts: Mutex::new(HashMap::new()),
             pages: Mutex::new(HashMap::new()),
             events,
@@ -133,8 +134,19 @@ impl Browser {
         !self.cdp.is_closed()
     }
 
-    pub fn config(&self) -> &Config {
-        &self.config
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config.lock().expect("config lock"))
+    }
+
+    /// Takes a reloaded configuration of the same browser instance (see [`Config::same_browser`]).
+    pub fn set_config(&self, config: Arc<Config>) {
+        let humanize = config.humanize;
+        let old = std::mem::replace(&mut *self.config.lock().expect("config lock"), config);
+        if old.humanize != humanize {
+            for page in self.pages() {
+                page.set_humanize(humanize);
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TargetEvent> {
@@ -220,7 +232,7 @@ impl Browser {
     }
 
     pub fn profiles(&self) -> Result<Profiles> {
-        Profiles::load(&self.config.user_data_dir)
+        Profiles::load(&self.config().user_data_dir)
     }
 
     pub fn profile_of_context(&self, context: &str) -> Option<String> {
@@ -322,23 +334,32 @@ impl Browser {
     async fn launch_tab(&self, profile: &Profile) -> Result<String> {
         let nonce = format!("{:016x}", fastrand::u64(..));
         let marker = format!("data:text/html,<title>hba {nonce}</title>");
-        let focus = crate::niri::focused_window().await;
-        endpoint::launch(&self.config, &[format!("--profile-directory={}", profile.dir), marker.clone()])?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let tab = loop {
-            if let Some(tab) = self.tabs().await?.into_iter().find(|tab| tab.url == marker) {
-                break tab;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{} did not open a tab in profile {:?}", self.config.browser.name(), profile.name);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        crate::niri::restore_focus(focus).await;
+        // The launcher may raise the browser's window: focus goes back however the wait ends,
+        // also when the command is cancelled.
+        let refocus = Undo::new(crate::niri::restore_focus(crate::niri::focused_window().await));
+        let opened = self.open_marked(profile, &marker).await;
+        refocus.finish().await;
+        let tab = opened?;
         if let Some(context) = &tab.browser_context_id {
             self.learn_context(context, &profile.dir);
         }
         Ok(tab.target_id)
+    }
+
+    /// Has the launcher open `marker` in `profile` and waits for its tab.
+    async fn open_marked(&self, profile: &Profile, marker: &str) -> Result<TargetInfo> {
+        let config = self.config();
+        endpoint::launch(&config, &[format!("--profile-directory={}", profile.dir), marker.to_owned()])?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(tab) = self.tabs().await?.into_iter().find(|tab| tab.url == marker) {
+                return Ok(tab);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("{} did not open a tab in profile {:?}", config.browser.name(), profile.name);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     pub async fn close_target(&self, target: &str) -> Result<()> {
@@ -355,7 +376,7 @@ impl Browser {
         if let Some(page) = self.pages.lock().expect("pages lock").get(tab).filter(|page| page.is_live()).cloned() {
             return Ok(page);
         }
-        let page = Page::attach(self.cdp.clone(), Arc::clone(&self.world), self.config.humanize, tab).await?;
+        let page = Page::attach(self.cdp.clone(), Arc::clone(&self.world), self.config().humanize, tab).await?;
         self.pages.lock().expect("pages lock").insert(tab.to_owned(), Arc::clone(&page));
         Ok(page)
     }

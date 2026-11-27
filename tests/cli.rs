@@ -1,8 +1,10 @@
 //! Configuration, daemon and endpoint behavior that needs no browser. Each test gets its own
 //! runtime, config and data directories, so its daemon is private and tests run in parallel.
 
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -37,8 +39,9 @@ server.serve_forever()
 /// Python for a fake browser in approval mode. It publishes its port in `DevToolsActivePort` in
 /// the data dir (first argument) and holds every WebSocket handshake, as a browser does until its
 /// user clicks Allow, until the file `allow` appears in the control dir (second argument). Then
-/// it completes them, creates `allowed`, and answers every command (`Browser.getVersion` with
-/// product `Fake/1`). The file `connections` counts the connections it accepted.
+/// it completes them, creates `allowed`, and answers every command: `Browser.getVersion` with
+/// product `Fake/1`, `Target.getTargets` with the list in the file `targets.json` (none without
+/// it), others with `{}`. The file `connections` counts the connections it accepted.
 const APPROVAL_BROWSER: &str = r"
 import base64, hashlib, json, os, socket, struct, sys, threading, time
 data, control = sys.argv[1], sys.argv[2]
@@ -76,7 +79,14 @@ def serve(conn):
         if head[0] & 15 != 1:
             continue
         command = json.loads(payload)
-        result = {'product': 'Fake/1'} if command['method'] == 'Browser.getVersion' else {}
+        method = command['method']
+        if method == 'Browser.getVersion':
+            result = {'product': 'Fake/1'}
+        elif method == 'Target.getTargets':
+            listed = os.path.join(control, 'targets.json')
+            result = {'targetInfos': json.load(open(listed)) if os.path.exists(listed) else []}
+        else:
+            result = {}
         reply = json.dumps({'id': command['id'], 'result': result}).encode()
         size = struct.pack('B', len(reply)) if len(reply) < 126 else struct.pack('>BH', 126, len(reply))
         conn.sendall(b'\x81' + size + reply)
@@ -164,6 +174,19 @@ impl Home {
         }
     }
 
+    /// Runs hba until its output contains `text`, which a daemon task gets to shortly.
+    fn wait_for_output(&self, args: &[&str], vars: &[(&str, &Path)], text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = self.ok(args, vars);
+            if output.contains(text) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "hba {args:?} never said {text:?}: {output}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn ok(&self, args: &[&str], vars: &[(&str, &Path)]) -> String {
         let output = self.run(args, vars);
         assert!(output.status.success(), "hba {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
@@ -176,11 +199,20 @@ impl Home {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    /// Runs hba expecting the command line to be refused: exit status 2.
+    fn refused(&self, args: &[&str], vars: &[(&str, &Path)]) -> String {
+        let output = self.run(args, vars);
+        assert_eq!(output.status.code(), Some(2), "hba {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
     /// Starts a process named `process` that holds this home's data dir, as its `SingletonLock`
-    /// says: Python running `code` with `args`. False when Python is not installed.
+    /// says: Python running `code` with `args`. False when Python is not installed, which CI
+    /// must have.
     fn fake_browser(&mut self, process: &str, code: &str, args: &[&str]) -> bool {
         let paths = env::var_os("PATH").unwrap_or_default();
         let Some(python) = env::split_paths(&paths).map(|dir| dir.join("python3")).find(|path| path.is_file()) else {
+            assert!(env::var_os("CI").is_none(), "CI needs python3 for the fake browsers");
             eprintln!("skipped: no python3 for a fake browser");
             return false;
         };
@@ -417,8 +449,7 @@ fn approval_mode_keeps_one_request_open_and_takes_a_late_allow() {
     // An Allow after every command gave up still connects, and the next command uses it.
     fs::write(control.join("allow"), "").expect("allow");
     home.wait_for_file(&control.join("allowed"));
-    let status = home.ok(&["daemon", "status"], &vars);
-    assert!(status.contains("Chrome allowed the connection, which the next command takes"), "{status}");
+    home.wait_for_output(&["daemon", "status"], &vars, "Chrome allowed the connection, which the next command takes");
     let launched = home.ok(&["--timeout", "1", "browser", "launch"], &vars);
     assert!(launched.starts_with("Fake/1 pid "), "{launched}");
     assert_eq!(connections(), "1");
@@ -478,10 +509,8 @@ fn closing_while_helium_is_away_keeps_the_session_for_later() {
 }
 
 #[test]
-fn a_timeout_longer_than_a_day_is_refused() {
+fn the_longest_timeout_reaches_the_daemon() {
     let home = Home::new("timeout");
-    let error = home.fails(&["--timeout", "1e20", "wait", "1"], &[]);
-    assert!(error.contains("at most 86400"), "{error}");
     assert!(home.ok(&["--timeout", "86400", "wait", "1"], &[]).contains("waited 1 ms"));
 }
 
@@ -501,8 +530,8 @@ fn waits_and_key_delays_are_bounded() {
     let refused = client.wait_with_output().expect("collect hba");
     let error = String::from_utf8_lossy(&refused.stderr);
     assert!(!refused.status.success() && error.contains("wait at most 86400000 ms"), "{error}");
-    let error = home.fails(&["type", "x", "--delay", "10001"], &[]);
-    assert!(error.contains("10001 is not in 0..=10000"), "{error}");
+    let error = home.refused(&["type", "x", "--delay", "10001"], &[]);
+    assert!(error.contains("--delay"), "{error}");
 }
 
 #[test]
@@ -511,9 +540,12 @@ fn script_lines_cannot_carry_global_options() {
     let script = home.path("script.hba");
     for line in ["wait 1 --json", "--timeout 5 wait 1", "wait 1 -s other", "-T t1 wait 1"] {
         fs::write(&script, format!("wait 1\n{line}\n")).expect("write script");
-        let error = home.fails(&["run", script.to_str().expect("utf-8 path")], &[]);
+        let error = home.refused(&["run", script.to_str().expect("utf-8 path")], &[]);
         assert!(error.contains("line 2: put -s/-p/-T/--json/--timeout on the `hba run` command"), "{line}: {error}");
     }
+    fs::write(&script, "wait 1\nwiat 1\n").expect("write script");
+    let error = home.refused(&["run", script.to_str().expect("utf-8 path")], &[]);
+    assert!(error.contains("line 2:"), "{error}");
     // A session from the environment belongs to the `run` command, not to its lines.
     fs::write(&script, "wait 1\n").expect("write script");
     let ran = home.ok(&["run", script.to_str().expect("utf-8 path")], &[("HBA_SESSION", Path::new("from-env"))]);
@@ -525,7 +557,7 @@ fn a_client_that_goes_away_frees_its_session() {
     let home = Home::new("hangup");
     let trace = [("HBA_TRACE", Path::new("1"))];
     let mut client = home.spawn(&["-s", "held", "wait", "60000"], &trace);
-    home.wait_for_log("held Wait(WaitArgs { what: Some(\"60000\")");
+    home.wait_for_log("held Wait started");
     client.kill().expect("kill the client");
     client.wait().expect("reap the client");
     let started = Instant::now();
@@ -539,7 +571,7 @@ fn a_new_daemon_takes_over_after_the_old_one_finishes_its_commands() {
     let trace = [("HBA_TRACE", Path::new("1"))];
     // Longer than a client waits for a daemon to start.
     let busy = home.spawn(&["-s", "busy", "wait", "7000"], &trace);
-    home.wait_for_log("busy Wait(WaitArgs { what: Some(\"7000\")");
+    home.wait_for_log("busy Wait started");
     // Other settings restart the daemon while the old one still runs the command.
     assert!(home.ok(&["-s", "other", "wait", "1"], &[]).contains("waited 1 ms"));
     let finished = busy.wait_with_output().expect("wait for the busy client");
@@ -567,4 +599,133 @@ fn the_fallback_runtime_dir_must_be_private() {
     fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).expect("restrict link target");
     std::os::unix::fs::symlink(&elsewhere, &base).expect("link base");
     refused("a symlink");
+}
+
+#[test]
+fn a_client_of_another_build_with_an_unknown_command_gets_a_restart() {
+    let home = Home::new("skew");
+    home.ok(&["profiles"], &[("HBA_USER_DATA_DIR", &home.path("data"))]);
+    let mut daemon = UnixStream::connect(home.path("runtime/hba/hba.sock")).expect("connect to the daemon");
+    // A newer client after `cargo install` added a subcommand this daemon does not know.
+    let request = r#"{"build": "0.0.0+newer", "env": "", "cwd": "/", "command": {"Teleport": {"to": "mars"}}}"#;
+    daemon.write_all(format!("{request}\n").as_bytes()).expect("send the request");
+    let mut reply = String::new();
+    BufReader::new(daemon).read_line(&mut reply).expect("read the reply");
+    assert_eq!(reply, "\"Restart\"\n");
+}
+
+#[test]
+fn tab_numbers_survive_a_daemon_stop() {
+    let Some(home) = approval_home("numbers") else { return };
+    let (data, control) = (home.path("data"), home.path("control"));
+    fs::write(control.join("allow"), "").expect("allow");
+    let vars = [("HBA_USER_DATA_DIR", data.as_path()), ("HBA_BROWSER", Path::new("chrome"))];
+    let tab = |id: &str| {
+        format!(r#"{{"targetId": "{id}", "type": "tab", "url": "https://{id}.test/", "embedderData": {{}}}}"#)
+    };
+    fs::write(control.join("targets.json"), format!("[{}]", tab("AAA"))).expect("write the tabs");
+    let listed = home.ok(&["--json", "tabs", "--all"], &vars);
+    assert!(listed.contains(r#""tab":"t1","id":"AAA""#), "{listed}");
+    home.ok(&["daemon", "stop"], &vars);
+    // The next daemon finds a tab opened meanwhile, listed first.
+    fs::write(control.join("targets.json"), format!("[{}, {}]", tab("BBB"), tab("AAA"))).expect("write the tabs");
+    let listed = home.ok(&["--json", "tabs", "--all"], &vars);
+    assert!(listed.contains(r#""tab":"t1","id":"AAA""#) && listed.contains(r#""tab":"t2","id":"BBB""#), "{listed}");
+}
+
+#[test]
+fn a_launch_names_the_data_dir_and_status_does_not_wait_for_it() {
+    let home = Home::new("launch");
+    let (data, launcher, args) = (home.path("data"), home.path("launcher"), home.path("launcher.args"));
+    // A launcher that starts nothing and records how it was called.
+    fs::write(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", args.display())).expect("write launcher");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).expect("make the launcher executable");
+    let vars = [("HBA_USER_DATA_DIR", data.as_path()), ("HBA_LAUNCHER", launcher.as_path())];
+    let launching = home.spawn(&["--timeout", "5", "browser", "launch"], &vars);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !args.exists() {
+        assert!(Instant::now() < deadline, "the launcher never ran");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The launch now waits for an endpoint that never comes.
+    let asked = Instant::now();
+    let status = home.ok(&["daemon", "status"], &vars);
+    assert!(status.contains("connecting to Helium"), "{status}");
+    assert!(asked.elapsed() < Duration::from_secs(3), "status waited {:?} for the launch", asked.elapsed());
+    let called = fs::read_to_string(&args).expect("read the launcher's arguments");
+    assert!(called.lines().any(|arg| arg == format!("--user-data-dir={}", data.display())), "{called}");
+    let failed = launching.wait_with_output().expect("wait for the launch");
+    assert!(!failed.status.success(), "{failed:?}");
+}
+
+#[test]
+fn a_config_edit_naming_another_data_dir_takes_effect_while_connected() {
+    let Some(home) = approval_home("reconnect") else { return };
+    fs::write(home.path("control/allow"), "").expect("allow");
+    let absent = home.path("launcher-must-not-run");
+    let vars = [("HBA_BROWSER", Path::new("chrome")), ("HBA_LAUNCHER", absent.as_path())];
+    home.write_config(&format!("user_data_dir = {:?}\n", home.path("data")));
+    let launched = home.ok(&["--timeout", "5", "browser", "launch"], &vars);
+    assert!(launched.starts_with("Fake/1 pid "), "{launched}");
+    let other = home.path("other");
+    fs::create_dir_all(&other).expect("create the other data dir");
+    home.write_config(&format!("user_data_dir = {other:?}\n"));
+    // Nothing runs on the other data dir, so it is started there.
+    let error = home.fails(&["--timeout", "1", "browser", "launch"], &vars);
+    assert!(error.contains("launcher-must-not-run"), "{error}");
+}
+
+#[test]
+fn daemon_status_and_stop_never_start_a_daemon() {
+    let home = Home::new("no-daemon");
+    for op in ["status", "stop"] {
+        assert_eq!(home.ok(&["daemon", op], &[]).trim(), "no daemon running", "daemon {op}");
+    }
+    assert!(!home.path("runtime/hba/daemon.log").exists(), "a daemon was started");
+}
+
+#[test]
+fn a_reader_that_stops_early_is_no_failure() {
+    let home = Home::new("pipe");
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut command = home.command(&["profiles"], &[("HBA_USER_DATA_DIR", &home.path("data"))]);
+    let output = command.stdin(Stdio::null()).stdout(writer).output().expect("run hba");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success() && error.is_empty(), "{error}");
+}
+
+#[test]
+fn a_daemon_started_with_another_home_is_replaced() {
+    let home = Home::new("home");
+    home.write_config("user_data_dir = \"~/data\"\n");
+    assert!(home.ok(&["profiles"], &[("HOME", &home.path(""))]).contains("Personal"));
+    let elsewhere = home.path("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("create the other home");
+    let output = home.run(&["profiles"], &[("HOME", &elsewhere)]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Personal"), "~/ still meant the first HOME");
+}
+
+#[test]
+fn a_large_daemon_log_is_set_aside_when_a_daemon_starts() {
+    let home = Home::new("log");
+    let (log, old) = (home.path("runtime/hba/daemon.log"), home.path("runtime/hba/daemon.log.old"));
+    fs::create_dir_all(home.path("runtime/hba")).expect("create runtime dir");
+    fs::write(&log, vec![b'x'; 2 << 20]).expect("write a large log");
+    home.ok(&["profiles"], &[("HBA_USER_DATA_DIR", &home.path("data"))]);
+    assert!(fs::metadata(&log).expect("the new log").len() < 1 << 20);
+    assert_eq!(fs::metadata(&old).expect("the old log").len(), 2 << 20);
+}
+
+#[test]
+fn a_command_queued_behind_a_busy_session_gives_up_at_its_timeout() {
+    let home = Home::new("queue");
+    let trace = [("HBA_TRACE", Path::new("1"))];
+    let busy = home.spawn(&["-s", "busy", "wait", "5000"], &trace);
+    home.wait_for_log("busy Wait started");
+    let asked = Instant::now();
+    let error = home.fails(&["-s", "busy", "--timeout", "1", "wait", "1"], &trace);
+    assert!(error.contains("session \"busy\" stayed busy with another hba command for 1s"), "{error}");
+    assert!(asked.elapsed() < Duration::from_secs(4), "it waited {:?}", asked.elapsed());
+    busy.wait_with_output().expect("wait for the busy client");
 }

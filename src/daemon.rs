@@ -5,19 +5,19 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 
-use crate::browser::Browser;
+use crate::browser::{Browser, TargetEvent, TargetInfo};
 use crate::cdp::{Cdp, Event};
-use crate::cli::MAX_TIMEOUT;
+use crate::cli::{Command, MAX_TIMEOUT};
 use crate::config::Config;
 use crate::injected::Source;
-use crate::ipc::{self, BUILD, DAEMON_DRAIN, Reply, Request};
+use crate::ipc::{self, BUILD, DAEMON_DRAIN, Header, Reply, Request};
 use crate::page::Page;
 use crate::profiles::{Profile, Profiles};
 use crate::session::{Session, Store};
@@ -32,10 +32,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// unanswered when it exited: the browser still shows its dialog, before any later one.
 const ABANDONED: &str = "abandoned-approval";
 
+/// Directory in the runtime directory for screenshots, PDFs, HARs and other artifacts.
+const FILES: &str = "files";
+
+/// How long artifacts are kept: the runtime directory is usually in RAM.
+const ARTIFACT_LIFETIME: Duration = Duration::from_secs(86_400);
+
 /// The environment this daemon started with; see [`ipc::daemon_env`].
 static DAEMON_ENV: LazyLock<String> = LazyLock::new(ipc::daemon_env);
 
 pub fn main() -> ExitCode {
+    // Trace times count from here.
+    LazyLock::force(&crate::trace::START);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
     let outcome = runtime.map_err(anyhow::Error::from).and_then(|runtime| runtime.block_on(serve()));
     match outcome {
@@ -49,16 +57,18 @@ pub fn main() -> ExitCode {
 
 async fn serve() -> Result<()> {
     let runtime = ipc::runtime_dir()?;
+    let socket = ipc::socket_path(&runtime);
     let lock = std::fs::File::create(runtime.join("daemon.lock"))?;
     // A daemon that is shutting down holds the lock until its last command finishes.
     let deadline = Instant::now() + DAEMON_DRAIN + Duration::from_secs(5);
     while lock.try_lock().is_err() {
-        if Instant::now() >= deadline {
-            return Ok(()); // Another daemon is running.
+        // Another daemon serves: one started at the same time won, or one never stops.
+        if Instant::now() >= deadline || UnixStream::connect(&socket).await.is_ok() {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let socket = ipc::socket_path(&runtime);
+    prune_artifacts(&runtime.join(FILES), SystemTime::now());
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     let hub = Arc::new(Hub::new(runtime.clone()));
@@ -89,8 +99,9 @@ async fn serve() -> Result<()> {
         }
     }
     // New clients start a fresh daemon, which takes over once the commands in flight finish.
-    drop(listener);
+    // Clients already queued are told to retry, which reaches that daemon.
     let _ = std::fs::remove_file(&socket);
+    refuse_queued(listener, &mut connections);
     let drained = async {
         while connections.join_next().await.is_some() {}
         // The browser shows its approval dialogs one at a time, oldest first, and closing a
@@ -164,12 +175,17 @@ impl Hub {
         let mut waited = None;
         loop {
             let mut slot = self.browser.lock().await;
-            if let Some(browser) = slot.as_ref().filter(|browser| browser.is_connected()) {
-                return Ok(Arc::clone(browser));
-            }
             let config = self.config()?;
+            if let Some(browser) = slot.as_ref().filter(|browser| browser.is_connected()) {
+                if browser.config().same_browser(&config) {
+                    browser.set_config(config);
+                    return Ok(Arc::clone(browser));
+                }
+                // The config file now names another browser or data directory.
+                browser.cdp.close();
+            }
             let profile: &Option<String> = profile.get_or_insert_with(|| launch_profile.take().and_then(|hint| hint()));
-            let endpoint = crate::endpoint::ensure_running(&config, profile.as_deref()).await?;
+            let endpoint = crate::endpoint::ensure_running(&config, profile.as_deref(), deadline).await?;
             let name = config.browser.name();
             let socket = if endpoint.approval {
                 match self.approval(&endpoint.ws_url, waited.as_ref()) {
@@ -301,6 +317,17 @@ impl Hub {
         self.browser.lock().await.as_ref().filter(|browser| browser.is_connected()).cloned()
     }
 
+    /// Where the browser connection stands, without waiting for a command that is connecting.
+    pub fn link(&self) -> Link {
+        match self.browser.try_lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .filter(|browser| browser.is_connected())
+                .map_or(Link::Unconnected, |browser| Link::Connected(Arc::clone(browser))),
+            Err(_) => Link::Connecting,
+        }
+    }
+
     pub fn save_contexts(&self, browser: &Browser) {
         let mut store = self.store.lock().expect("store lock");
         store.contexts = browser.contexts();
@@ -316,20 +343,26 @@ impl Hub {
         if read.read_line(&mut line).await.is_err() || line.is_empty() {
             return;
         }
-        let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(request) if request.build != BUILD || request.env != *DAEMON_ENV => {
-                self.stop.notify_one();
-                Reply::Restart
-            }
+        let reply = match admit(&line, &DAEMON_ENV) {
             Ok(request) => match self.execute(request, hung_up(read)).await {
                 Some(reply) => reply,
                 None => return,
             },
-            Err(error) => Reply::Done { stdout: String::new(), stderr: format!("hba: bad request: {error}"), code: 2 },
+            Err(Reply::Restart) => {
+                self.stop.notify_one();
+                Reply::Restart
+            }
+            Err(refused) => refused,
         };
-        let mut text = serde_json::to_string(&reply).unwrap_or_default();
-        text.push('\n');
-        let _ = write.write_all(text.as_bytes()).await;
+        let _ = write.write_all(reply.line().as_bytes()).await;
+    }
+
+    /// The lock that keeps a session's commands in order. Locks of sessions no command holds or
+    /// waits for are dropped meanwhile.
+    fn session_lock(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().expect("locks lock");
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(locks.entry(session.to_owned()).or_default())
     }
 
     /// Runs a request. `None` when the client went away first (Ctrl-C, killed by its caller):
@@ -350,7 +383,7 @@ impl Hub {
             },
         };
         let session = request.session.clone().unwrap_or_else(|| default_session(&request.cwd));
-        let lock = Arc::clone(self.locks.lock().expect("locks lock").entry(session.clone()).or_default());
+        let lock = self.session_lock(&session);
         let mut cx = Cx {
             hub: self,
             cwd: request.cwd,
@@ -363,24 +396,25 @@ impl Hub {
             touched: Vec::new(),
         };
         let started = Instant::now();
-        let name = if *crate::trace::ENABLED {
-            format!("{:?}", request.command).chars().take(100).collect::<String>()
-        } else {
-            String::new()
-        };
+        let name = if *crate::trace::ENABLED { command_name(&request.command) } else { String::new() };
         let mut hung_up = std::pin::pin!(hung_up);
         // Commands of one session run in order.
         let locked = if request.command.is_local() {
             Some(Ok(None))
         } else {
             tokio::select! {
-                locked = tokio::time::timeout(Duration::from_secs(120), lock.lock_owned()) => Some(locked.map(Some)),
+                locked = tokio::time::timeout(timeout, lock.lock_owned()) => Some(locked.map(Some)),
                 () = &mut hung_up => None,
             }
         };
         let outcome = match locked {
             None => None,
-            Some(Err(_)) => Some(Err(anyhow::anyhow!("session {:?} is busy with another hba command", cx.session))),
+            Some(Err(_)) => Some(Err(anyhow::anyhow!(
+                "session {:?} stayed busy with another hba command for {}s; run this again once it finishes, or in \
+                 another session (-s NAME)",
+                cx.session,
+                timeout.as_secs_f32()
+            ))),
             Some(Ok(_guard)) => {
                 crate::trace!("{} {name} started", cx.session);
                 let outcome = tokio::select! {
@@ -473,6 +507,77 @@ pub fn abandoned_note(name: &str) -> String {
     )
 }
 
+/// Where this daemon's browser connection stands, for status reports.
+pub enum Link {
+    Connected(Arc<Browser>),
+    /// A command is connecting, or starting the browser.
+    Connecting,
+    Unconnected,
+}
+
+/// The request a client sent, or the reply refusing it. The build is checked before the rest is
+/// parsed: a client of another build may send a command this one does not know. Daemon commands
+/// are served whatever environment their client has; others need the one this daemon has.
+fn admit(line: &str, env: &str) -> Result<Request, Reply> {
+    let bad = |error: serde_json::Error| Reply::Done {
+        stdout: String::new(),
+        stderr: format!("hba: bad request: {error}"),
+        code: 1,
+    };
+    let header: Header = serde_json::from_str(line).map_err(bad)?;
+    if header.build != BUILD {
+        return Err(Reply::Restart);
+    }
+    let request: Request = serde_json::from_str(line).map_err(bad)?;
+    if request.env != env && !request.command.is_local() {
+        return Err(Reply::Restart);
+    }
+    Ok(request)
+}
+
+/// Answers [`Reply::Restart`] to the clients that connected before the listener closed: their
+/// next attempt reaches the daemon that takes over.
+fn refuse_queued(listener: UnixListener, connections: &mut tokio::task::JoinSet<()>) {
+    let Ok(listener) = listener.into_std() else { return };
+    while let Ok((stream, _)) = listener.accept() {
+        if stream.set_nonblocking(true).is_ok()
+            && let Ok(stream) = UnixStream::from_std(stream)
+        {
+            connections.spawn(refuse(stream));
+        }
+    }
+}
+
+async fn refuse(stream: UnixStream) {
+    let (read, mut write) = stream.into_split();
+    let mut line = String::new();
+    if BufReader::new(read).read_line(&mut line).await.is_ok_and(|read| read > 0) {
+        let _ = write.write_all(Reply::Restart.line().as_bytes()).await;
+    }
+}
+
+/// A command's name for the trace, without its arguments: those can hold typed text and secrets.
+fn command_name(command: &Command) -> String {
+    match serde_json::to_value(command) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(serde_json::Value::Object(fields)) => fields.into_iter().next().map(|(name, _)| name).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Deletes the artifacts in `dir` last changed more than [`ARTIFACT_LIFETIME`] before `now`.
+fn prune_artifacts(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let expired = meta.modified().is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > ARTIFACT_LIFETIME));
+        if expired {
+            let path = entry.path();
+            let _ = if meta.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        }
+    }
+}
+
 /// Commands in flight and when the last one ended: what the idle exit goes by.
 struct Activity {
     running: usize,
@@ -556,11 +661,12 @@ impl Cx<'_> {
         self.hub.config()
     }
 
-    /// A new file in the runtime directory, e.g. for screenshots.
+    /// A new file in the runtime directory, e.g. for screenshots. Those older than a day go.
     pub fn artifact(&self, stem: &str, extension: &str) -> Result<PathBuf> {
-        let dir = self.hub.runtime.join("files");
+        let dir = self.hub.runtime.join(FILES);
         std::fs::create_dir_all(&dir)?;
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+        prune_artifacts(&dir, SystemTime::now());
+        let stamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
         Ok(dir.join(format!("{}-{stem}-{stamp}.{extension}", self.session)))
     }
 
@@ -695,10 +801,14 @@ impl Cx<'_> {
         }
     }
 
-    /// Releases the remote objects the command held; a busy renderer's answer is not awaited.
+    /// Releases the remote objects the command held (a busy renderer's answer is not awaited),
+    /// and saves the tab numbers it handed out.
     fn release(&mut self) {
         for page in self.touched.drain(..) {
             page.release();
+        }
+        if let Err(error) = self.hub.store.lock().expect("store lock").save_changes() {
+            eprintln!("hba: {error:#}");
         }
     }
 
@@ -713,15 +823,7 @@ impl Cx<'_> {
     /// took over the user's view, the tab they were looking at is shown again.
     pub async fn adopt_popups(&mut self, browser: &Browser, page: &Page, mut watch: PopupWatch) -> Result<()> {
         let Some(opener) = page.page_target() else { return Ok(()) };
-        let mut popups = Vec::new();
-        while let Ok(event) = watch.events.try_recv() {
-            if let crate::browser::TargetEvent::Created(info) = event
-                && info.kind == "page"
-                && info.opener_id.as_deref() == Some(opener.as_str())
-            {
-                popups.push(info);
-            }
-        }
+        let popups = popups_of(&mut watch.events, &opener);
         if popups.is_empty() {
             return Ok(());
         }
@@ -747,15 +849,30 @@ impl Cx<'_> {
 
 /// Tabs opened during an action, and the tabs that were on screen before it.
 pub struct PopupWatch {
-    events: tokio::sync::broadcast::Receiver<crate::browser::TargetEvent>,
+    events: broadcast::Receiver<TargetEvent>,
     shown: Vec<String>,
 }
 
-fn shown_tabs(tabs: &[crate::browser::TargetInfo]) -> Vec<String> {
+fn shown_tabs(tabs: &[TargetInfo]) -> Vec<String> {
     tabs.iter()
         .filter(|tab| tab.embedder_data.as_ref().is_some_and(|strip| strip.active))
         .map(|tab| tab.target_id.clone())
         .collect()
+}
+
+/// Pages `opener` opened, among the target events received so far. Events a slow reader missed
+/// are skipped, not the ones after them.
+fn popups_of(events: &mut broadcast::Receiver<TargetEvent>, opener: &str) -> Vec<Arc<TargetInfo>> {
+    let mut popups = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(TargetEvent::Created(info)) if info.kind == "page" && info.opener_id.as_deref() == Some(opener) => {
+                popups.push(info);
+            }
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return popups,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -840,6 +957,107 @@ mod tests {
         // Exiting with this request unanswered leaves it for the next daemon.
         hub.record_abandoned();
         assert_eq!(std::fs::read_to_string(&marker).expect("marker"), url);
+        std::fs::remove_dir_all(runtime).ok();
+    }
+
+    /// A request line as a client of `build` with environment `env` sends it.
+    fn request_line(build: &str, env: &str, command: &serde_json::Value) -> String {
+        let request = serde_json::json!({
+            "build": build, "env": env, "cwd": "/", "session": null, "profile": null, "tab": null,
+            "json": false, "timeout_secs": null, "command": command,
+        });
+        request.to_string()
+    }
+
+    #[test]
+    fn requests_are_admitted_by_build_then_by_environment() {
+        use serde_json::json;
+        // A newer client may send a command this build does not know: it needs another daemon.
+        let unknown = request_line("0.0.0+newer", "mine", &json!({"Teleport": {"to": "mars"}}));
+        assert!(matches!(admit(&unknown, "mine"), Err(Reply::Restart)));
+        assert!(matches!(admit(&request_line(BUILD, "theirs", &json!("Back")), "mine"), Err(Reply::Restart)));
+        assert!(admit(&request_line(BUILD, "mine", &json!("Back")), "mine").is_ok());
+        // Daemon commands are about whichever daemon runs.
+        let status = request_line(BUILD, "theirs", &json!({"Daemon": {"op": "Status"}}));
+        assert!(admit(&status, "mine").is_ok_and(|request| request.command.is_local()));
+        let garbled = request_line(BUILD, "mine", &json!({"Teleport": {}}));
+        assert!(matches!(admit(&garbled, "mine"), Err(Reply::Done { code: 1, .. })));
+        assert!(matches!(admit("{", "mine"), Err(Reply::Done { code: 1, .. })));
+    }
+
+    #[test]
+    fn the_trace_names_a_command_without_its_arguments() {
+        use clap::Parser as _;
+        let command = |args: &[&str]| crate::cli::Cli::try_parse_from(args).expect("parse").command;
+        assert_eq!(command_name(&command(&["hba", "fill", "e1", "hunter2"])), "Fill");
+        assert_eq!(command_name(&command(&["hba", "back"])), "Back");
+    }
+
+    #[test]
+    fn popups_after_events_a_slow_reader_missed_are_still_found() {
+        let (events, mut watch) = broadcast::channel(2);
+        let page = |id: &str, opener: &str| {
+            let info = serde_json::json!({"targetId": id, "type": "page", "openerId": opener});
+            TargetEvent::Created(Arc::new(serde_json::from_value(info).expect("target info")))
+        };
+        for event in [page("A", "other"), page("B", "other"), page("P", "me")] {
+            events.send(event).expect("send");
+        }
+        let popups = popups_of(&mut watch, "me");
+        let found: Vec<&str> = popups.iter().map(|info| info.target_id.as_str()).collect();
+        assert_eq!(found, ["P"]);
+    }
+
+    #[test]
+    fn artifacts_older_than_a_day_are_deleted() {
+        let dir = std::env::temp_dir().join(format!("hba-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("old-trace")).expect("create the directories");
+        let now = SystemTime::now();
+        let old = now - ARTIFACT_LIFETIME - Duration::from_secs(60);
+        for (name, at) in [("old.png", old), ("old-trace", old), ("new.png", now - Duration::from_secs(60))] {
+            let path = dir.join(name);
+            let file = if path.is_dir() { std::fs::File::open(&path) } else { std::fs::File::create(&path) };
+            file.expect("open").set_modified(at).expect("set the time");
+        }
+        prune_artifacts(&dir, now);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["new.png"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn locks_of_sessions_nothing_waits_for_are_dropped() {
+        let (hub, runtime) = hub("locks");
+        let held = hub.session_lock("busy");
+        drop(hub.session_lock("done"));
+        drop(hub.session_lock("next"));
+        let mut names: Vec<String> = hub.locks.lock().expect("locks lock").keys().cloned().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["busy", "next"]);
+        drop(held);
+        std::fs::remove_dir_all(runtime).ok();
+    }
+
+    #[tokio::test]
+    async fn clients_queued_at_shutdown_are_told_to_restart() {
+        use std::io::{BufRead as _, Write as _};
+        let (_hub, runtime) = hub("queued");
+        let path = runtime.join("queued.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let mut client = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        client.write_all(request_line(BUILD, "", &serde_json::json!("Back")).as_bytes()).expect("send");
+        client.write_all(b"\n").expect("send");
+        let mut connections = tokio::task::JoinSet::new();
+        refuse_queued(listener, &mut connections);
+        while connections.join_next().await.is_some() {}
+        let mut reply = String::new();
+        std::io::BufReader::new(client).read_line(&mut reply).expect("the reply");
+        assert_eq!(reply, Reply::Restart.line(), "not dropped with the listener");
         std::fs::remove_dir_all(runtime).ok();
     }
 }

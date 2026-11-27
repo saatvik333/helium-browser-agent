@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::cdp::Cdp;
 use crate::cli::{BrowserOp, DaemonOp};
 use crate::config::{BrowserKind, Config};
-use crate::daemon::{ApprovalRequest, Cx};
+use crate::daemon::{ApprovalRequest, Cx, Link};
 use crate::endpoint;
 
 pub async fn browser(cx: &mut Cx<'_>, op: BrowserOp) -> Result<()> {
@@ -20,7 +20,7 @@ pub async fn browser(cx: &mut Cx<'_>, op: BrowserOp) -> Result<()> {
             cx.say(format!("{}{pid}", browser.product));
         }
         BrowserOp::Endpoint => {
-            let endpoint = endpoint::discover(&*cx.config()?)?;
+            let endpoint = endpoint::discover_off_thread(&cx.config()?).await?;
             cx.say(endpoint.ws_url);
         }
         BrowserOp::Restart => restart(cx).await?,
@@ -45,9 +45,10 @@ async fn restart(cx: &mut Cx<'_>) -> Result<()> {
         dirs.push(profiles.last_used.clone().unwrap_or_else(|| "Default".to_owned()));
     }
     let count = dirs.len();
+    let deadline = tokio::time::Instant::now() + cx.timeout;
     // A task of its own: a client that hangs up cancels the command, which must not leave the
     // browser quit.
-    tokio::spawn(relaunch(browser.cdp.clone(), config, pid, dirs))
+    tokio::spawn(relaunch(browser.cdp.clone(), config, pid, dirs, deadline))
         .await
         .with_context(|| format!("restarting {name}"))??;
     let browser = cx.browser().await?;
@@ -55,60 +56,73 @@ async fn restart(cx: &mut Cx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Quits the browser `pid` and launches it again with the profile directories `dirs`.
-async fn relaunch(cdp: Cdp, config: Arc<Config>, pid: u32, dirs: Vec<String>) -> Result<()> {
+/// Quits the browser `pid` and launches it again with the profile directories `dirs`, by `deadline`.
+async fn relaunch(
+    cdp: Cdp,
+    config: Arc<Config>,
+    pid: u32,
+    dirs: Vec<String>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let name = config.browser.name();
+    // A port on its command line (how Chrome gets one) is in no flags file: the new start keeps it.
+    let port = endpoint::flag_port(pid);
     cdp.send("Browser.close", json!({}), None).await.ok();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while std::path::Path::new(&format!("/proc/{pid}")).exists() {
         if tokio::time::Instant::now() >= deadline {
             bail!("{name} did not exit; a dialog (e.g. unsaved form) may be blocking it");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    for (index, dir) in dirs.iter().enumerate() {
-        endpoint::launch(&config, &[format!("--profile-directory={dir}"), "--restore-last-session".to_owned()])?;
-        if index == 0 {
-            // The first launch starts the browser; later ones reach it through its singleton.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                // Discovery reads /proc and may wait a second for `/json/version`: off the runtime thread.
-                let config = Arc::clone(&config);
-                if tokio::task::spawn_blocking(move || endpoint::discover(&config).is_ok()).await? {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    bail!("{name} restarted but its DevTools endpoint did not come back");
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+    let Some((first, rest)) = dirs.split_first() else { return Ok(()) };
+    let reopen = |dir: &str| vec![format!("--profile-directory={dir}"), "--restore-last-session".to_owned()];
+    let mut args = reopen(first);
+    args.extend(port.map(|port| format!("--remote-debugging-port={port}")));
+    endpoint::launch(&config, &args)?;
+    while endpoint::discover_off_thread(&config).await.is_err() {
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "{name} restarted but its DevTools endpoint did not come back in time; `hba browser launch` \
+                 connects once it does"
+            );
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The browser is up: these reach it through its singleton.
+    for dir in rest {
+        endpoint::launch(&config, &reopen(dir))?;
     }
     Ok(())
 }
 
-pub async fn daemon(cx: &mut Cx<'_>, op: DaemonOp) -> Result<()> {
+pub fn daemon(cx: &mut Cx<'_>, op: DaemonOp) {
     match op {
         DaemonOp::Status => {
             let uptime = cx.hub.started.elapsed().as_secs();
             cx.say(format!("hba {} pid {} up {}m{}s", crate::ipc::BUILD, std::process::id(), uptime / 60, uptime % 60));
             let name = cx.config().map_or("the browser", |config| config.browser.name());
-            match (cx.hub.connected().await, cx.hub.approval_request()) {
-                (Some(browser), _) => {
+            match (cx.hub.link(), cx.hub.approval_request()) {
+                (Link::Connected(browser), _) => {
                     cx.say(format!("connected to {} at {}", browser.product, browser.endpoint.ws_url));
                 }
-                (None, Some(ApprovalRequest::Waiting { behind })) => {
+                (_, Some(ApprovalRequest::Waiting { behind })) => {
                     let note = if behind { crate::daemon::abandoned_note(name) } else { String::new() };
                     cx.say(format!("not connected: waiting for Allow in {name}'s dialog (approval mode){note}"));
                 }
-                (None, Some(ApprovalRequest::Allowed)) => {
+                (_, Some(ApprovalRequest::Allowed)) => {
                     cx.say(format!("not connected yet: {name} allowed the connection, which the next command takes"));
                 }
-                (None, None) => cx.say("not connected to a browser"),
+                (Link::Connecting, None) => cx.say(format!("connecting to {name}")),
+                (Link::Unconnected, None) => cx.say("not connected to a browser"),
             }
             let sessions: Vec<String> = {
                 let store = cx.hub.store.lock().expect("store lock");
-                store.sessions.iter().map(|(name, s)| format!("{name} ({} tabs)", s.tabs.len())).collect()
+                store
+                    .sessions
+                    .iter()
+                    .filter(|(_, session)| !session.tabs.is_empty())
+                    .map(|(name, session)| format!("{name} ({})", crate::output::count(session.tabs.len(), "tab")))
+                    .collect()
             };
             if !sessions.is_empty() {
                 cx.say(format!("sessions: {}", sessions.join(", ")));
@@ -133,7 +147,6 @@ pub async fn daemon(cx: &mut Cx<'_>, op: DaemonOp) -> Result<()> {
             });
         }
     }
-    Ok(())
 }
 
 pub async fn doctor(cx: &mut Cx<'_>) -> Result<()> {
@@ -162,7 +175,7 @@ pub async fn doctor(cx: &mut Cx<'_>) -> Result<()> {
         })
     });
     let inspect = config.browser.inspect_page();
-    let found = endpoint::discover(&config);
+    let found = endpoint::discover_off_thread(&config).await;
     // A browser in approval mode has the switch on, even before it saved that to `Local State`.
     let switch = endpoint::switch_on(&config) || found.as_ref().is_ok_and(|endpoint| endpoint.approval);
     // Started with the flag on its own command line rather than from the flags file.

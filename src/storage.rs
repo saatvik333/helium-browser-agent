@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum as _;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +17,7 @@ use serde_json::{Value, json};
 use crate::browser::Browser;
 use crate::cli::{CookiesArgs, CookiesOp, PermsOp, SaveLoad, StateArgs, StorageArea, StorageArgs, StorageOp};
 use crate::daemon::Cx;
+use crate::output::{web_host, web_origin};
 use crate::page::{Arg, Page};
 
 /// Characters of a cookie or storage value shown in lists.
@@ -117,36 +119,14 @@ fn domain_matches(domain: &str, host: &str) -> bool {
     host == domain || host.strip_suffix(domain.as_str()).is_some_and(|rest| rest.ends_with('.'))
 }
 
-/// `scheme://host[:port]` of an http(s) URL, the default port dropped; `None` for other URLs.
-pub fn web_origin(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return None;
+impl Cookie {
+    /// Whether setting this cookie overwrites `other`: the same name, scope and partition.
+    fn replaces(&self, other: &Cookie) -> bool {
+        self.name == other.name
+            && self.path == other.path
+            && self.domain.eq_ignore_ascii_case(&other.domain)
+            && self.partition_key == other.partition_key
     }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host).to_ascii_lowercase();
-    if authority.is_empty() {
-        return None;
-    }
-    let default_port = if scheme == "http" { ":80" } else { ":443" };
-    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
-    Some(format!("{scheme}://{authority}"))
-}
-
-/// Host of an http(s) URL, without the port.
-fn web_host(url: &str) -> Option<String> {
-    let origin = web_origin(url)?;
-    let authority = origin.split_once("://")?.1;
-    let host = match authority.rsplit_once(':') {
-        Some((host, port))
-            if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !authority.ends_with(']') =>
-        {
-            host
-        }
-        _ => authority,
-    };
-    Some(host.to_owned())
 }
 
 /// The page's browser context (its profile).
@@ -432,14 +412,7 @@ pub async fn cookies(cx: &mut Cx<'_>, args: CookiesArgs) -> Result<()> {
         }
         Some(CookiesOp::Clear) => {
             let cookies = site_cookies(&page, &host).await?;
-            let deletions = cookies.iter().map(|cookie| {
-                let mut params = json!({"name": cookie.name, "domain": cookie.domain, "path": cookie.path});
-                if let Some(key) = &cookie.partition_key {
-                    params["partitionKey"] = key.clone();
-                }
-                page.cdp.send("Network.deleteCookies", params, Some(&session))
-            });
-            join_all(deletions).await.into_iter().collect::<Result<Vec<()>>>()?;
+            delete_cookies(&page, &session, &cookies).await?;
             cx.say(format!("removed {} reaching {host}", crate::output::count(cookies.len(), "cookie")));
         }
     }
@@ -540,7 +513,7 @@ pub async fn storage(cx: &mut Cx<'_>, args: StorageArgs) -> Result<()> {
                 bail!(
                     "{name} of {} has no key {key:?}; `hba storage {}` lists them",
                     origin_label(&outcome.origin),
-                    area_arg(area)
+                    area.to_possible_value().expect("every area has a name").get_name()
                 );
             };
             cx.say(if cx.json { serde_json::to_string(&value)? } else { value });
@@ -568,13 +541,6 @@ pub async fn storage(cx: &mut Cx<'_>, args: StorageArgs) -> Result<()> {
     Ok(())
 }
 
-fn area_arg(area: StorageArea) -> &'static str {
-    match area {
-        StorageArea::Local => "local",
-        StorageArea::Session => "session",
-    }
-}
-
 /// A `state` file: Playwright's `storageState` layout plus session storage.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -588,10 +554,11 @@ struct SavedState {
 #[serde(rename_all = "camelCase")]
 struct SavedOrigin {
     origin: String,
-    #[serde(default)]
-    local_storage: Vec<Item>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    session_storage: Vec<Item>,
+    /// An area the file does not mention is left alone on load; one it lists replaces the page's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_storage: Option<Vec<Item>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_storage: Option<Vec<Item>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -634,13 +601,29 @@ async fn save_state(cx: &mut Cx<'_>, page: &Page, host: &str, path: &Path) -> Re
         cookies,
         origins: vec![SavedOrigin {
             origin: local.origin.clone(),
-            local_storage: items(local.items),
-            session_storage: items(session.items),
+            local_storage: Some(items(local.items)),
+            session_storage: Some(items(session.items)),
         }],
     };
     crate::output::write_private(path, serde_json::to_string_pretty(&state)?.as_bytes())?;
-    cx.say(format!("saved {} ({counts} of {})", path.display(), local.origin));
-    cx.say("it holds login secrets, so only you can read it (mode 600)");
+    cx.say(format!("saved {} ({counts} of {}; mode 600, holds login secrets)", path.display(), local.origin));
+    Ok(())
+}
+
+/// What `saved` does not replace of the cookies `have`: loading a state drops these.
+fn stale_cookies(have: Vec<Cookie>, saved: &[Cookie]) -> Vec<Cookie> {
+    have.into_iter().filter(|cookie| !saved.iter().any(|keep| keep.replaces(cookie))).collect()
+}
+
+async fn delete_cookies(page: &Page, session: &str, cookies: &[Cookie]) -> Result<()> {
+    let deletions = cookies.iter().map(|cookie| {
+        let mut params = json!({"name": cookie.name, "domain": cookie.domain, "path": cookie.path});
+        if let Some(key) = &cookie.partition_key {
+            params["partitionKey"] = key.clone();
+        }
+        page.cdp.send("Network.deleteCookies", params, Some(session))
+    });
+    join_all(deletions).await.into_iter().collect::<Result<Vec<()>>>()?;
     Ok(())
 }
 
@@ -660,6 +643,7 @@ async fn load_state(cx: &mut Cx<'_>, page: &Page, host: &str, path: &Path) -> Re
         serde_json::from_str(&text).with_context(|| format!("{} is not a state file", path.display()))?;
     let (cookies, other_sites) = reaching(state.cookies, host);
     let session = page.session()?;
+    let dropped = stale_cookies(site_cookies(page, host).await?, &cookies);
     if !cookies.is_empty() {
         let params: Vec<Value> = cookies.iter().map(Cookie::param).collect();
         page.cdp
@@ -667,8 +651,13 @@ async fn load_state(cx: &mut Cx<'_>, page: &Page, host: &str, path: &Path) -> Re
             .await
             .context("restoring cookies")?;
     }
+    // Dropped only once the saved ones are in, so a failure leaves the login as it was.
+    delete_cookies(page, &session, &dropped).await?;
     let origin = web_origin(&page.url()).unwrap_or_default();
     let mut restored = vec![crate::output::count(cookies.len(), "cookie")];
+    if !dropped.is_empty() {
+        restored.push(format!("{} dropped", crate::output::count(dropped.len(), "other cookie")));
+    }
     let mut others = Vec::new();
     for saved in state.origins {
         if web_origin(&saved.origin).as_deref() != Some(origin.as_str()) {
@@ -677,22 +666,19 @@ async fn load_state(cx: &mut Cx<'_>, page: &Page, host: &str, path: &Path) -> Re
         }
         let areas = [(StorageArea::Local, saved.local_storage), (StorageArea::Session, saved.session_storage)];
         for (area, entries) in areas {
-            if entries.is_empty() {
-                continue;
-            }
+            let Some(entries) = entries else { continue };
             let pairs: Vec<(String, String)> = entries.into_iter().map(|item| (item.name, item.value)).collect();
             let outcome = storage_call(page, area, "replace", "", json!(pairs)).await?;
             restored.push(format!("{} ({})", area.property(), crate::output::count(outcome.count, "key")));
         }
     }
-    cx.say(format!("restored {} for {origin}", restored.join(", ")));
+    cx.say(format!("restored {} for {origin}; reload to use it", restored.join(", ")));
     if !other_sites.is_empty() {
         cx.say(format!("cookies of {} are for other sites: open each and load again", other_sites.join(", ")));
     }
     if !others.is_empty() {
         cx.say(format!("storage of {} is for other origins: open each and load again", others.join(", ")));
     }
-    cx.say("reload so the page uses it: `hba reload`");
     Ok(())
 }
 
@@ -708,7 +694,7 @@ pub async fn perms(cx: &mut Cx<'_>, op: PermsOp) -> Result<()> {
             let descriptors: Vec<Value> = permissions.iter().flat_map(|name| descriptors(name)).collect();
             grant(&page, &descriptors, &origin, Holder::Perms).await?;
             cx.say(format!(
-                "granted {} to {origin} in this profile until hba lets go of {} and of any other tab with a grant there",
+                "granted {} to {origin} until {} is released",
                 permissions.join(", "),
                 cx.tab_number(&page.tab)
             ));
@@ -800,19 +786,20 @@ mod tests {
                        "origins":[{"origin":"https://x.com","localStorage":[{"name":"k","value":"v"}]}]}"#;
         let state: SavedState = serde_json::from_str(text).expect("valid");
         assert_eq!(state.cookies[0].same_site.as_deref(), Some("None"));
-        assert_eq!(state.origins[0].local_storage[0].value, "v");
-        assert!(state.origins[0].session_storage.is_empty());
+        assert_eq!(state.origins[0].local_storage.as_ref().expect("listed")[0].value, "v");
+        assert!(state.origins[0].session_storage.is_none(), "an absent area is left alone on load");
     }
 
     #[test]
-    fn origins_and_hosts() {
-        assert_eq!(web_origin("http://127.0.0.1:8765/a?b").as_deref(), Some("http://127.0.0.1:8765"));
-        assert_eq!(web_origin("HTTPS://user@Example.com:443/").as_deref(), Some("https://example.com"));
-        assert_eq!(web_origin("file:///tmp/x.html"), None);
-        assert_eq!(web_origin("about:blank"), None);
-        assert_eq!(web_host("http://127.0.0.1:8765/").as_deref(), Some("127.0.0.1"));
-        assert_eq!(web_host("http://[::1]:8080/").as_deref(), Some("[::1]"));
-        assert_eq!(web_host("https://[::1]/").as_deref(), Some("[::1]"));
+    fn saved_cookies_replace_the_sites_other_cookies() {
+        let have =
+            vec![cookie("example.com"), Cookie { name: "old".into(), ..cookie("example.com") }, cookie(".Example.com")];
+        let saved = [cookie(".example.com")];
+        let stale = stale_cookies(have, &saved);
+        assert_eq!(stale.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["sid", "old"]);
+        assert_eq!(stale_cookies(vec![cookie("a.com")], &[cookie("a.com")]).len(), 0);
+        let moved = Cookie { path: "/app".into(), ..cookie("a.com") };
+        assert_eq!(stale_cookies(vec![moved], &[cookie("a.com")]).len(), 1, "another path is another cookie");
     }
 
     #[test]

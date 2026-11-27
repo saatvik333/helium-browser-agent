@@ -13,6 +13,7 @@ use crate::browser::{Browser, TargetInfo};
 use crate::cli::{CloseArgs, LoadState, TabOp, TabsArgs, WindowArgs, WindowState};
 use crate::daemon::Cx;
 use crate::output::{short_url, truncate};
+use crate::session::Store;
 use crate::undo::Undo;
 
 /// One tab as listed to the user (and as `--json`).
@@ -26,30 +27,36 @@ struct Row {
     profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     window: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     shown: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pinned: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     grouped: bool,
     /// Session holding the tab, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     current: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     adopted: bool,
+}
+
+/// Who holds a tab: its session, whether the tab was adopted from the user, and whether it is
+/// the current tab of `own_session`.
+fn ownership(store: &Store, own_session: &str, tab: &str) -> (Option<String>, bool, bool) {
+    let holder = store.holder(tab).map(str::to_owned);
+    let session = holder.as_deref().and_then(|name| store.sessions.get(name));
+    let adopted = session.is_some_and(|s| s.tabs.iter().any(|t| t.id == tab && t.adopted));
+    let current = holder.as_deref() == Some(own_session) && session.is_some_and(|s| s.current.as_deref() == Some(tab));
+    (holder, adopted, current)
 }
 
 impl Row {
     fn new(cx: &Cx<'_>, info: &TargetInfo) -> Self {
         let strip = info.embedder_data.clone().unwrap_or_default();
-        let (session, adopted) = {
-            let store = cx.hub.store.lock().expect("store lock");
-            let holder = store.holder(&info.target_id).map(str::to_owned);
-            let adopted = holder
-                .as_deref()
-                .and_then(|name| store.sessions.get(name))
-                .is_some_and(|s| s.tabs.iter().any(|t| t.id == info.target_id && t.adopted));
-            (holder, adopted)
-        };
-        let current = session.as_deref() == Some(cx.session.as_str())
-            && cx.session_data().current.as_deref() == Some(info.target_id.as_str());
+        let (session, adopted, current) =
+            ownership(&cx.hub.store.lock().expect("store lock"), &cx.session, &info.target_id);
         Self {
             tab: cx.tab_number(&info.target_id),
             id: info.target_id.clone(),
@@ -100,10 +107,22 @@ fn print_json(cx: &mut Cx<'_>, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Every tab of the browser from one `Target.getTargets`; forgets vanished tabs and numbers new
+/// ones like `Cx::live_tabs`, which returns only the ids.
+async fn live(cx: &Cx<'_>, browser: &Browser) -> Result<Vec<TargetInfo>> {
+    let tabs = browser.tabs().await?;
+    let ids: Vec<String> = tabs.iter().map(|tab| tab.target_id.clone()).collect();
+    let mut store = cx.hub.store.lock().expect("store lock");
+    store.prune(&ids);
+    for id in &ids {
+        store.number(id);
+    }
+    Ok(tabs)
+}
+
 pub async fn list(cx: &mut Cx<'_>, args: TabsArgs) -> Result<()> {
     let browser = cx.browser().await?;
-    cx.live_tabs(&browser).await?;
-    let tabs = browser.tabs().await?;
+    let tabs = live(cx, &browser).await?;
     if !args.all {
         let session = cx.session_data();
         let rows: Vec<Row> = tabs.iter().filter(|t| session.owns(&t.target_id)).map(|t| Row::new(cx, t)).collect();
@@ -391,14 +410,14 @@ pub async fn status(cx: &mut Cx<'_>) -> Result<()> {
         return Ok(());
     };
     let profile = cx.chosen_profile(&browser).ok();
-    cx.live_tabs(&browser).await?;
+    let tabs = live(cx, &browser).await?;
     let session = cx.session_data();
-    let mut rows = Vec::new();
-    for tab in &session.tabs {
-        if let Some(info) = browser.tab_info(&tab.id).await? {
-            rows.push(Row::new(cx, &info));
-        }
-    }
+    let rows: Vec<Row> = session
+        .tabs
+        .iter()
+        .filter_map(|tab| tabs.iter().find(|info| info.target_id == tab.id))
+        .map(|info| Row::new(cx, info))
+        .collect();
     let dialog =
         session.current.as_deref().and_then(|current| browser.attached(current)).and_then(|page| page.dialog());
     if cx.json {
@@ -451,12 +470,13 @@ pub async fn close(cx: &mut Cx<'_>, args: CloseArgs) -> Result<()> {
     let Some(browser) = running_browser(cx).await? else {
         bail!("{} is not running; session state kept for a later `hba close`", cx.config()?.browser.name());
     };
+    let live: Vec<String> = browser.tabs().await?.into_iter().map(|info| info.target_id).collect();
     let (mut closed, mut released) = (0, 0);
     for (name, tab) in &tabs {
         if tab.adopted {
             browser.detach(&tab.id).await;
             released += 1;
-        } else if browser.tab_info(&tab.id).await?.is_some() {
+        } else if live.contains(&tab.id) {
             browser.close_target(&tab.id).await?;
             closed += 1;
         }
@@ -466,4 +486,62 @@ pub async fn close(cx: &mut Cx<'_>, args: CloseArgs) -> Result<()> {
     }
     cx.say(format!("closed {}, released {released}", crate::output::count(closed, "tab")));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        let mut store = Store::default();
+        let mine = store.session("mine");
+        mine.add("OWN", false);
+        mine.add("USER", true);
+        mine.current = Some("USER".to_owned());
+        store.session("other").add("THEIRS", false);
+        store
+    }
+
+    #[test]
+    fn ownership_names_the_holder() {
+        let store = store();
+        assert_eq!(ownership(&store, "mine", "OWN"), (Some("mine".to_owned()), false, false));
+        assert_eq!(ownership(&store, "mine", "FREE"), (None, false, false));
+    }
+
+    #[test]
+    fn adopted_and_current_are_reported() {
+        let store = store();
+        assert_eq!(ownership(&store, "mine", "USER"), (Some("mine".to_owned()), true, true));
+    }
+
+    #[test]
+    fn another_sessions_current_tab_is_not_ours() {
+        let mut store = store();
+        store.session("other").current = Some("THEIRS".to_owned());
+        assert_eq!(ownership(&store, "mine", "THEIRS"), (Some("other".to_owned()), false, false));
+    }
+
+    #[test]
+    fn json_rows_leave_out_false_flags() {
+        let row = Row {
+            tab: "t1".into(),
+            id: "AAA".into(),
+            title: String::new(),
+            url: "https://x.test/".into(),
+            profile: None,
+            window: None,
+            shown: false,
+            pinned: true,
+            grouped: false,
+            session: None,
+            current: false,
+            adopted: false,
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["pinned"], true);
+        for flag in ["shown", "grouped", "current", "adopted"] {
+            assert!(value.get(flag).is_none(), "{flag} should be omitted");
+        }
+    }
 }

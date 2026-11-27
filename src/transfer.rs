@@ -26,11 +26,6 @@ const STEP_PAUSE: Duration = Duration::from_millis(16);
 /// How long the browser may take to hand over a drag the page started.
 const DRAG_HANDOVER: Duration = Duration::from_secs(2);
 
-/// How long actions wait for an element to become actionable (as `actions` does).
-fn patience(cx: &Cx<'_>) -> Duration {
-    cx.timeout.min(Duration::from_secs(10))
-}
-
 /// The next signal `pick` accepts within `timeout`, if any.
 async fn next_signal<T>(
     signals: &mut broadcast::Receiver<Signal>,
@@ -75,7 +70,7 @@ pub async fn upload(cx: &mut Cx<'_>, args: UploadArgs) -> Result<()> {
     let paths = file_paths(cx, &args.files)?;
     let page = cx.page().await?;
     let browser = cx.browser().await?;
-    let element = page.resolve(&args.target, patience(cx)).await?;
+    let element = page.resolve(&args.target, actions::action_timeout(cx)).await?;
     // A file input, or the input a label points at.
     let input = page
         .call_handle(
@@ -98,7 +93,7 @@ pub async fn upload(cx: &mut Cx<'_>, args: UploadArgs) -> Result<()> {
                 .send("DOM.setFileInputFiles", json!({"files": paths, "objectId": input}), Some(&element.world.session))
                 .await?;
         }
-        None => choose_files(&page, &element, &paths, patience(cx)).await?,
+        None => choose_files(&page, &element, &paths, actions::action_timeout(cx)).await?,
     }
     cx.say(format!("uploaded {} to {}", names(&paths), element.label));
     actions::after(cx, &browser, &page, &mark, watch, false).await
@@ -163,7 +158,7 @@ enum Drag {
 pub async fn drag(cx: &mut Cx<'_>, args: DragArgs) -> Result<()> {
     let page = cx.page().await?;
     let browser = cx.browser().await?;
-    let patience = patience(cx);
+    let patience = actions::action_timeout(cx);
     let source = page.resolve(&args.source, patience).await?;
     let destination = page.resolve(&args.destination, patience).await?;
     let from = actions::actionable_point(&page, &source, None, false, patience).await?;
@@ -232,9 +227,18 @@ async fn drag_to(
                 )
                 .await?;
             }
-            Drag::Pressed if step == 1 => {
-                // The page decides with the first move whether this becomes an HTML5 drag.
-                mouse_event(page, "mouseMoved", point, 1).await?;
+            Drag::Pressed => {
+                // The page decides with the first moves whether this becomes an HTML5 drag; Blink
+                // starts one only after the pointer has travelled a few pixels, so every step asks.
+                if step == 1 {
+                    mouse_event(page, "mouseMoved", point, 1).await?;
+                } else {
+                    // Later moves go out without waiting: a page that is not drawing takes a lone
+                    // move only after a second, and the release delivers them in order.
+                    let moved = json!({"type": "mouseMoved", "x": point.0, "y": point.1, "button": "left",
+                                       "buttons": 1, "clickCount": 1, "pointerType": "mouse"});
+                    drop(page.send_input("Input.dispatchMouseEvent", &moved)?);
+                }
                 if let Some(data) = handed_over(page, source, &mut signals).await? {
                     page.input(
                         "Input.dispatchDragEvent",
@@ -243,13 +247,6 @@ async fn drag_to(
                     .await?;
                     *state = Drag::Html5(data);
                 }
-            }
-            Drag::Pressed => {
-                // Later moves go out without waiting: a page that is not drawing takes a lone
-                // move only after a second, and the release delivers them in order.
-                let moved = json!({"type": "mouseMoved", "x": point.0, "y": point.1, "button": "left", "buttons": 1,
-                                   "clickCount": 1, "pointerType": "mouse"});
-                drop(page.send_input("Input.dispatchMouseEvent", &moved)?);
             }
         }
         page.set_mouse(point);

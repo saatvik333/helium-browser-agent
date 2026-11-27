@@ -1,8 +1,9 @@
 //! Downloads started from a tab, observed without changing the browser's download settings.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -27,10 +28,13 @@ pub struct Download {
     pub started: Instant,
 }
 
+/// Downloads kept per tab.
+const CAPACITY: usize = 100;
+
 /// The tab's recent downloads, numbered so actions can report the ones they caused.
 #[derive(Debug, Default)]
 pub struct Log {
-    pub items: Vec<Download>,
+    pub items: VecDeque<Download>,
     seq: u64,
 }
 
@@ -52,6 +56,15 @@ impl Log {
             let _ = writeln!(out, "+ download {} ({})", where_, item.state);
         }
     }
+
+    /// Numbers a new download and keeps it, dropping the oldest beyond [`CAPACITY`].
+    fn begin(&mut self, build: impl FnOnce(u64) -> Download) {
+        self.seq += 1;
+        self.items.push_back(build(self.seq));
+        if self.items.len() > CAPACITY {
+            self.items.pop_front();
+        }
+    }
 }
 
 /// Records `Browser.download*` events that belong to this tab's frames.
@@ -70,10 +83,7 @@ pub fn on_event(page: &Page, event: &Event) {
             if page.frame_session(&begin.frame_id).is_none() {
                 return;
             }
-            let mut log = page.downloads.lock().expect("downloads lock");
-            log.seq += 1;
-            let seq = log.seq;
-            log.items.push(Download {
+            page.downloads.lock().expect("downloads lock").begin(|seq| Download {
                 seq,
                 guid: begin.guid,
                 url: begin.url,
@@ -84,10 +94,6 @@ pub fn on_event(page: &Page, event: &Event) {
                 total: 0,
                 started: Instant::now(),
             });
-            if log.items.len() > 100 {
-                log.items.remove(0);
-            }
-            drop(log);
             page.signal(Signal::Download);
         }
         "Browser.downloadProgress" => {
@@ -126,7 +132,7 @@ pub fn on_event(page: &Page, event: &Event) {
 pub async fn command(cx: &mut Cx<'_>, args: DownloadArgs) -> Result<()> {
     let page = cx.page().await?;
     let browser = cx.browser().await?;
-    let patience = cx.timeout.min(Duration::from_secs(10));
+    let patience = crate::actions::action_timeout(cx);
     let element = page.resolve(&args.target, patience).await?;
     let point = crate::actions::actionable_point(&page, &element, None, false, patience).await?;
     let watch = cx.watch(&browser).await;
@@ -234,5 +240,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&to).expect("read"), "data");
         assert!(!from.exists());
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_log_keeps_the_latest_downloads_and_numbers_them_on() {
+        let mut log = Log::default();
+        for n in 0..CAPACITY + 5 {
+            log.begin(|seq| Download {
+                seq,
+                guid: n.to_string(),
+                url: String::new(),
+                filename: format!("f{n}"),
+                state: "inProgress".to_owned(),
+                path: None,
+                received: 0,
+                total: 0,
+                started: Instant::now(),
+            });
+        }
+        assert_eq!(log.items.len(), CAPACITY);
+        assert_eq!(log.items.front().map(|item| item.seq), Some(6));
+        assert_eq!(log.seq(), (CAPACITY + 5) as u64);
+        assert_eq!(log.since(log.seq() - 2).count(), 2);
     }
 }

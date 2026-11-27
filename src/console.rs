@@ -24,6 +24,10 @@ use crate::page::Page;
 /// Messages kept per tab.
 const CAPACITY: usize = 1000;
 
+/// Characters of one message kept; a page logging a megabyte of state would otherwise hold
+/// a gigabyte across [`CAPACITY`] messages.
+const MAX_KEPT: usize = 16 * 1024;
+
 /// Characters of one message shown by `hba console` and `hba errors`.
 const MAX_TEXT: usize = 4000;
 
@@ -197,8 +201,11 @@ impl Log {
         before - self.entries.len()
     }
 
-    /// Records a message, dropping the oldest beyond [`CAPACITY`].
-    pub fn push(&mut self, level: Level, text: String, location: String, exception: bool) {
+    /// Records a message, cut to [`MAX_KEPT`] characters, dropping the oldest beyond [`CAPACITY`].
+    pub fn push(&mut self, level: Level, mut text: String, location: String, exception: bool) {
+        if text.len() > MAX_KEPT {
+            text = crate::output::truncate(&text, MAX_KEPT).into_owned();
+        }
         self.seq += 1;
         if self.entries.len() == CAPACITY {
             self.entries.pop_front();
@@ -251,13 +258,8 @@ pub fn is_local_url(url: &str) -> bool {
         "file" | "chrome-extension" | "data" | "chrome" | "devtools" => true,
         "blob" => is_local_url(rest),
         "http" | "https" | "ws" | "wss" => {
-            let authority = rest.trim_start_matches('/').split(['/', '?', '#']).next().unwrap_or("");
-            let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-            let host = if host.starts_with('[') {
-                host.split_once(']').map_or(host, |(h, _)| &h[1..])
-            } else {
-                host.rsplit_once(':').map_or(host, |(h, _)| h)
-            };
+            let host = crate::output::host_of(rest.trim_start_matches('/'));
+            let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
             host == "localhost"
                 || host.ends_with(".localhost")
                 || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
@@ -675,5 +677,16 @@ mod tests {
         record(&mut log, &logged("A while shown", before));
         let texts: Vec<&str> = log.entries.iter().map(|entry| entry.text.as_str()).collect();
         assert_eq!(texts, ["A while shown", "B pagehide", "A pageshow"]);
+    }
+
+    #[test]
+    fn long_messages_are_cut_when_recorded() {
+        let mut log = Log::default();
+        log.push(Level::Log, "x".repeat(MAX_KEPT * 4), String::new(), false);
+        log.push(Level::Log, "é".repeat(MAX_KEPT), String::new(), false);
+        let sizes: Vec<usize> = log.entries.iter().map(|entry| entry.text.chars().count()).collect();
+        assert_eq!(sizes, [MAX_KEPT, MAX_KEPT]);
+        assert!(log.entries[0].text.ends_with('…'));
+        assert!(!log.entries[1].text.ends_with('…'));
     }
 }

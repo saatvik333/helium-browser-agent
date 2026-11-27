@@ -18,6 +18,48 @@ pub fn truncate(text: &str, max: usize) -> Cow<'_, str> {
     }
 }
 
+/// The host of a URL's authority, from the text after `scheme:`: userinfo, port and path are
+/// cut off, and an IPv6 host keeps its brackets. The case is left alone.
+pub fn host_of(rest: &str) -> &str {
+    let authority = authority_of(rest);
+    if authority.starts_with('[') {
+        return authority.find(']').map_or(authority, |end| &authority[..=end]);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
+}
+
+/// `host[:port]` of the text after `scheme:` (the leading `//` already removed), userinfo cut.
+fn authority_of(rest: &str) -> &str {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+}
+
+/// `scheme://host[:port]` of an http(s) URL, lowercase, the default port dropped; `None` for
+/// other URLs.
+pub fn web_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = authority_of(rest).to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "http" { ":80" } else { ":443" };
+    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// Lowercase host of an http(s) URL, without the port.
+pub fn web_host(url: &str) -> Option<String> {
+    let origin = web_origin(url)?;
+    Some(host_of(origin.split_once("://")?.1).to_owned())
+}
+
 /// `512 B`, `1.2 KB`, `84 KB`, `3.4 MB` (binary multiples).
 pub fn bytes(count: u64) -> String {
     const UNITS: [&str; 3] = ["KB", "MB", "GB"];
@@ -223,5 +265,26 @@ mod tests {
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!((std::fs::read_to_string(&path).expect("read"), mode), ("secret".to_owned(), 0o600));
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn origins_drop_default_ports_and_userinfo() {
+        assert_eq!(web_origin("http://127.0.0.1:8765/a?b").as_deref(), Some("http://127.0.0.1:8765"));
+        assert_eq!(web_origin("HTTPS://User:pw@Example.COM:443/x#y").as_deref(), Some("https://example.com"));
+        assert_eq!(web_origin("http://example.com:80").as_deref(), Some("http://example.com"));
+        assert_eq!(web_origin("file:///tmp/a"), None);
+        assert_eq!(web_origin("https:///nohost"), None);
+        assert_eq!(web_origin("about:blank"), None);
+    }
+
+    #[test]
+    fn hosts_lose_ports_and_userinfo_but_keep_ipv6_brackets() {
+        assert_eq!(web_host("https://a.b.test:8443/x").as_deref(), Some("a.b.test"));
+        assert_eq!(web_host("http://u@[::1]:3000/").as_deref(), Some("[::1]"));
+        assert_eq!(web_host("http://[::1]/").as_deref(), Some("[::1]"));
+        assert_eq!(host_of("localhost.evil.com/"), "localhost.evil.com");
+        assert_eq!(host_of("user@localhost:3000?x"), "localhost");
+        assert_eq!(host_of("localhost:evil/"), "localhost:evil");
+        assert_eq!(host_of("[::2]:1/"), "[::2]");
     }
 }

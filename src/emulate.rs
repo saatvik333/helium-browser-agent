@@ -529,7 +529,7 @@ pub async fn emulate(cx: &mut Cx<'_>, args: EmulateArgs) -> Result<()> {
     let next = current.merged(&args, device)?;
     let applied = transition(&browser, &page, &current, next).await?;
     cx.say(applied.summary());
-    if current.differs(&applied, Group::Agent) && crate::storage::web_origin(&page.url()).is_some() {
+    if current.differs(&applied, Group::Agent) && crate::output::web_origin(&page.url()).is_some() {
         cx.say("the server sees the new user agent or language after `hba reload`");
     }
     Ok(())
@@ -540,12 +540,15 @@ pub async fn emulate(cx: &mut Cx<'_>, args: EmulateArgs) -> Result<()> {
 async fn transition(browser: &Browser, page: &Page, current: &State, next: State) -> Result<State> {
     let starts_location = current.geolocation.is_none() && next.geolocation.is_some();
     let origin = if starts_location {
-        Some(crate::storage::web_origin(&page.url()).context(
+        Some(crate::output::web_origin(&page.url()).context(
             "location emulation allows geolocation for the page's origin, so it needs an http(s) page; `hba open URL` first",
         )?)
     } else {
         None
     };
+    // Recorded before the protocol calls, so a client that hangs up midway leaves the tab's
+    // state known; groups the page refuses are put back below.
+    *page.emulation.lock().expect("emulation lock") = next.clone();
     let (kept, refusal) = match apply(page, current, &next).await {
         Ok(()) => (next, None),
         Err(Refused { groups, error }) => {

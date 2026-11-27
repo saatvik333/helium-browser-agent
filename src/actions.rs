@@ -21,7 +21,7 @@ use crate::input;
 use crate::page::{Arg, Element, Mark, Page};
 
 /// How long actions wait for an element to become actionable.
-fn action_timeout(cx: &Cx<'_>) -> Duration {
+pub(crate) fn action_timeout(cx: &Cx<'_>) -> Duration {
     cx.timeout.min(Duration::from_secs(10))
 }
 

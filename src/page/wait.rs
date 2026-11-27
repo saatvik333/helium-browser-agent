@@ -239,7 +239,7 @@ impl Page {
         // without committing: a download or a 204 response stops the frame loading instead.
         let downloaded = || {
             let downloads = self.downloads.lock().expect("downloads lock");
-            downloads.items.iter().next_back().is_some_and(|item| item.started >= mark.at)
+            downloads.items.back().is_some_and(|item| item.started >= mark.at)
         };
         let ended = || {
             let state = self.state();

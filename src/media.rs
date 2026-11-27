@@ -269,7 +269,7 @@ pub async fn shot(cx: &mut Cx<'_>, args: ShotArgs) -> Result<()> {
     let page = cx.page().await?;
     let element = match &args.element {
         Some(target) => {
-            let element = page.resolve(target, cx.timeout.min(Duration::from_secs(10))).await?;
+            let element = page.resolve(target, crate::actions::action_timeout(cx)).await?;
             page.guarded(page.cdp.send(
                 "DOM.scrollIntoViewIfNeeded",
                 json!({"objectId": element.object}),

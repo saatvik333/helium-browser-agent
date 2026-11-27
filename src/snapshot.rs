@@ -68,13 +68,24 @@ pub struct Bounds {
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub interactive: bool,
     pub viewport: bool,
     pub boxes: bool,
     pub raw: bool,
     pub depth: Option<u32>,
+}
+
+/// A tab's last snapshot and how it was taken: `snap -d` compares only like with like.
+#[derive(Debug, Clone)]
+pub struct Baseline {
+    /// Loader of the document it shows.
+    pub loader: Option<String>,
+    pub options: Options,
+    /// Ref of the subtree it shows, or `None` for the whole page.
+    pub scope: Option<String>,
+    pub lines: Vec<String>,
 }
 
 /// A captured tree plus the information the renderer needs.
@@ -128,19 +139,23 @@ async fn capture_frame(
     page.note_snapshot(&world);
     let mut nodes = captured.json;
     if nesting < 4 && !captured.iframe_depths.is_empty() {
-        let mut frames = Vec::new();
-        for (reference, at_depth) in &captured.iframe_depths {
+        let wanted = captured.iframe_depths.iter().filter_map(|(reference, at_depth)| {
             let child_depth = depth.map(|d| d.saturating_sub(at_depth + 1));
-            if depth.is_some() && child_depth == Some(0) {
-                continue;
+            (child_depth != Some(0)).then_some((reference, child_depth))
+        });
+        // Frames render in their own processes, so they are captured side by side.
+        let children = futures_util::future::join_all(wanted.map(|(reference, child_depth)| {
+            let world = &world;
+            async move {
+                let child = child_frame(page, world, reference).await?;
+                let (children, _) =
+                    Box::pin(capture_frame(page, &child, options, child_depth, nesting + 1)).await.ok()?;
+                Some((reference, children))
             }
-            if let Some(child) = child_frame(page, &world, reference).await {
-                frames.push((reference.clone(), child, child_depth));
-            }
-        }
-        for (reference, child, child_depth) in frames {
-            let captured = Box::pin(capture_frame(page, &child, options, child_depth, nesting + 1)).await;
-            if let (Ok((children, _)), Some(iframe)) = (captured, iframe_mut(&mut nodes, &reference)) {
+        }))
+        .await;
+        for (reference, children) in children.into_iter().flatten() {
+            if let Some(iframe) = iframe_mut(&mut nodes, reference) {
                 iframe.children = children;
             }
         }
@@ -150,21 +165,8 @@ async fn capture_frame(
 
 /// The frame id inside the iframe element with `reference`.
 async fn child_frame(page: &Page, world: &crate::page::World, reference: &str) -> Option<String> {
-    let object = page
-        .call_handle(
-            world,
-            "function(ref) { return this.querySelector(this.parseSelector('aria-ref=' + ref), this.document, false) || null; }",
-            &[Arg::Value(json!(reference))],
-        )
-        .await
-        .ok()??;
-    let described: Value =
-        page.renderer_call("DOM.describeNode", json!({"objectId": object}), &world.session).await.ok()?;
-    let node = described.get("node")?;
-    node.get("frameId")
-        .or_else(|| node.get("contentDocument").and_then(|doc| doc.get("frameId")))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let object = page.ref_object(world, reference).await.ok()??;
+    page.content_frame(world, &object).await.ok()?
 }
 
 /// The iframe node with `reference`.
@@ -183,8 +185,8 @@ fn iframe_mut<'a>(nodes: &'a mut [Node], reference: &str) -> Option<&'a mut Elem
 }
 
 /// Renders the tree to YAML lines, applying compaction and filters.
-pub fn render(tree: &Tree, options: &Options) -> Vec<String> {
-    let mut nodes = tree.nodes.clone();
+pub fn render(tree: Tree, options: &Options) -> Vec<String> {
+    let mut nodes = tree.nodes;
     if options.viewport {
         nodes = in_viewport(nodes, tree.viewport);
     }
@@ -211,20 +213,17 @@ pub fn render(tree: &Tree, options: &Options) -> Vec<String> {
     lines
 }
 
-/// Like [`render`] but for the subtree of the element whose ref is `reference`.
-pub fn subtree(tree: &Tree, reference: &str) -> Option<Tree> {
-    fn find(nodes: &[Node], reference: &str) -> Option<Node> {
-        nodes.iter().find_map(|node| match node {
-            Node::Element(element) if element.reference.as_deref() == Some(reference) => Some(node.clone()),
-            Node::Element(element) => find(&element.children, reference),
+/// The part of the tree under the element whose ref is `reference`, for [`render`].
+pub fn subtree(tree: Tree, reference: &str) -> Option<Tree> {
+    fn take(nodes: Vec<Node>, reference: &str) -> Option<Node> {
+        nodes.into_iter().find_map(|node| match node {
+            Node::Element(element) if element.reference.as_deref() == Some(reference) => Some(Node::Element(element)),
+            Node::Element(element) => take(element.children, reference),
             Node::Text(_) => None,
         })
     }
-    find(&tree.nodes, reference).map(|node| Tree {
-        nodes: vec![node],
-        page_url: tree.page_url.clone(),
-        viewport: tree.viewport,
-    })
+    let Tree { nodes, page_url, viewport } = tree;
+    take(nodes, reference).map(|node| Tree { nodes: vec![node], page_url, viewport })
 }
 
 fn visit_text(lines: &mut Vec<String>, text: &str, depth: usize) {
@@ -654,7 +653,7 @@ mod tests {
             "  - paragraph [ref=e15]: \"Text: with colon\"",
             "  - text: loose text",
         ];
-        assert_eq!(render(&t, &raw()), expected);
+        assert_eq!(render(t, &raw()), expected);
     }
 
     /// Cases computed by Playwright's own `yamlStringNeedsQuotes` and escapers (1.64.1).
@@ -678,7 +677,7 @@ mod tests {
                 {"role": "link", "name": "JS", "ref": "e5", "cursor": "pointer", "url": "javascript:void(0)"}]},
             {"role": "generic", "ref": "e6", "text": "plain"},
             {"role": "generic", "ref": "e7", "cursor": "pointer", "text": "Click me"}]}]));
-        let lines = render(&t, &Options::default());
+        let lines = render(t, &Options::default());
         assert_eq!(
             lines,
             [
@@ -701,7 +700,7 @@ mod tests {
             {"role": "list", "ref": "e4", "children": [{"role": "listitem", "ref": "e5", "children": [
                 {"role": "button", "name": "Go", "ref": "e6"}]}]},
             {"role": "dialog", "name": "Confirm", "ref": "e7", "children": [{"role": "button", "name": "OK", "ref": "e8"}]}]}]));
-        let lines = render(&t, &Options { interactive: true, ..Options::default() });
+        let lines = render(t, &Options { interactive: true, ..Options::default() });
         assert_eq!(
             lines,
             [
@@ -719,7 +718,7 @@ mod tests {
         let t = tree(json!([
             {"role": "button", "name": "Top", "ref": "e1", "box": {"x": 10, "y": 10, "width": 50, "height": 20}},
             {"role": "button", "name": "Below", "ref": "e2", "box": {"x": 10, "y": 900, "width": 50, "height": 20}}]));
-        let lines = render(&t, &Options { viewport: true, ..Options::default() });
+        let lines = render(t, &Options { viewport: true, ..Options::default() });
         assert_eq!(lines, ["- button \"Top\" [ref=e1]"]);
     }
 

@@ -5,7 +5,7 @@
 //! into the page.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,11 +16,13 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 
+use crate::actions::Quads;
 use crate::cdp::Cdp;
 use crate::cli::{PdfArgs, ShotArgs};
 use crate::daemon::Cx;
 use crate::page::{Arg, Element, Page, World};
 use crate::snapshot::{self, Node};
+use crate::undo::Undo;
 
 /// Longest wait for the page to paint before a capture. Background tabs may paint about once a
 /// second; the capture itself asks for a frame, so this only makes it show the current DOM.
@@ -323,6 +325,7 @@ async fn take(page: &Page, request: &Request<'_>) -> Result<(Vec<u8>, usize)> {
     let ratio = view[2].as_f64().filter(|r| *r > 0.0).unwrap_or(1.0);
     let visual = &metrics.visual;
     let view_width = view[0].as_f64().filter(|w| *w > 0.0).unwrap_or(visual.client_width);
+    let view_height = view[1].as_f64().filter(|h| *h > 0.0).unwrap_or(visual.client_height);
     let clip = match request.element {
         Some(element) => element_clip(page, element, &metrics.layout, ratio).await?,
         None if request.full => {
@@ -367,13 +370,7 @@ async fn take(page: &Page, request: &Request<'_>) -> Result<(Vec<u8>, usize)> {
         if format == Format::Jpeg {
             params["quality"] = json!(request.quality);
         }
-        let raw = surface(page, &session, &params, BEYOND_AGAIN, request.timeout).await;
-        // The view is put back to its size before it is laid out again at that size.
-        if raw.is_err() {
-            restore_size(page, &world, &session, &size).await;
-        }
-        relayout(page, &world, &size).await;
-        let data = captured(&raw.context("capturing beyond the viewport")?)?;
+        let data = capture_beyond(page, &world, &session, &params, &size, request.timeout).await?;
         if !annotate {
             return Ok((decode(&data)?, 0));
         }
@@ -398,8 +395,9 @@ async fn take(page: &Page, request: &Request<'_>) -> Result<(Vec<u8>, usize)> {
             view
         } else {
             // Hidden in a way niri did not report, or no niri.
-            let device = (visual.client_width * ratio, visual.client_height * ratio);
-            grab_view(page, &session, device, request.timeout).await?
+            let visible = (visual.client_width * ratio, visual.client_height * ratio);
+            let whole = (view_width * ratio, view_height * ratio);
+            grab_view(page, &session, visible, whole, request.timeout).await?
         };
         let size = png_size(&view).context("the capture is not a PNG")?;
         (view, crop(size, view_width, wanted))
@@ -411,6 +409,34 @@ async fn take(page: &Page, request: &Request<'_>) -> Result<(Vec<u8>, usize)> {
     let labelled = boxes.len();
     let rendered = render(page, &world, image, &cut, boxes, request).await?;
     Ok((decode(&rendered)?, labelled))
+}
+
+/// A capture beyond the viewport with `params`. It resizes the page while it runs, so the page
+/// gets its `size` back however the capture ends, a cancelled command included.
+async fn capture_beyond(
+    page: &Page,
+    world: &World,
+    session: &Arc<str>,
+    params: &Value,
+    size: &Value,
+    timeout: Duration,
+) -> Result<String> {
+    let restore = Undo::new({
+        let (page, world, session, size) = (page.arc(), world.clone(), Arc::clone(session), size.clone());
+        async move {
+            restore_size(&page, &world, &session, &size).await;
+            relayout(&page, &world, &size).await;
+        }
+    });
+    let raw = surface(page, session, params, BEYOND_AGAIN, timeout).await;
+    // The view is put back to its size before it is laid out again at that size.
+    if raw.is_err() {
+        restore.finish().await;
+    } else {
+        restore.disarm();
+        relayout(page, world, size).await;
+    }
+    captured(&raw.context("capturing beyond the viewport")?)
 }
 
 /// Lays the page's root out again once the view is back to `size` (`[innerWidth, innerHeight]`).
@@ -557,9 +583,15 @@ const RENDER: &str = "async function(image, o) { \
 /// A base64 PNG of the whole view, grabbed without the compositor surface. A grab can go
 /// unanswered (every other one while the window is hidden), so another follows after the time a
 /// grab takes, until one answers. Helium may answer with the image of an earlier, abandoned
-/// request, so only a PNG covering `device`, the visible viewport in device pixels, is taken. A
-/// grab that fails while no other is pending ends the wait with its error.
-async fn grab_view(page: &Page, session: &str, device: (f64, f64), timeout: Duration) -> Result<String> {
+/// request, so only a PNG that [`fits`] `visible` and `whole` is taken. A grab that fails while
+/// no other is pending ends the wait with its error.
+async fn grab_view(
+    page: &Page,
+    session: &str,
+    visible: (f64, f64),
+    whole: (f64, f64),
+    timeout: Duration,
+) -> Result<String> {
     let params = json!({"format": "png", "fromSurface": false});
     let deadline = tokio::time::Instant::now() + timeout;
     let mut grabs = futures_util::stream::FuturesUnordered::new();
@@ -574,7 +606,7 @@ async fn grab_view(page: &Page, session: &str, device: (f64, f64), timeout: Dura
                     match answer {
                         Ok(raw) => {
                             let data = captured(&raw)?;
-                            if png_size(&data).is_some_and(|grab| covers(grab, device)) {
+                            if png_size(&data).is_some_and(|grab| fits(grab, visible, whole)) {
                                 return Ok(data);
                             }
                         }
@@ -599,31 +631,25 @@ async fn grab_view(page: &Page, session: &str, device: (f64, f64), timeout: Dura
     }
 }
 
-/// Whether a grab of `grab` pixels covers `device` (pixels of the visible viewport, which may be
-/// fractional). The view grows by the scrollbar, and a pixel of rounding is allowed.
-fn covers(grab: (u32, u32), device: (f64, f64)) -> bool {
-    f64::from(grab.0) >= (device.0 - 1.0).floor() && f64::from(grab.1) >= (device.1 - 1.0).floor()
+/// Whether `grab` pixels are a grab of the view: at least `visible` (the viewport without
+/// scrollbars, maybe fractional) and at most `whole` (the view with them), in device pixels, a
+/// pixel of rounding allowed. A full-page capture abandoned earlier is larger than the view.
+fn fits(grab: (u32, u32), visible: (f64, f64), whole: (f64, f64)) -> bool {
+    let (width, height) = (f64::from(grab.0), f64::from(grab.1));
+    width >= (visible.0 - 1.0).floor()
+        && height >= (visible.1 - 1.0).floor()
+        && width <= whole.0.ceil() + 1.0
+        && height <= whole.1.ceil() + 1.0
 }
 
 /// The element's border box in document coordinates, across frames.
 async fn element_clip(page: &Page, element: &Element, layout: &Viewport, ratio: f64) -> Result<Clip> {
-    #[derive(Deserialize)]
-    struct Quads {
-        quads: Vec<Vec<f64>>,
-    }
-    let quads: Quads = page
-        .renderer_call("DOM.getContentQuads", json!({"objectId": element.object}), &element.world.session)
-        .await
-        .with_context(|| format!("{} is not rendered", element.label))?;
-    let shift = crate::actions::frame_offset(page, &element.world.frame, &element.world.session).await?;
-    let points = quads
-        .quads
-        .iter()
-        .filter(|quad| quad.len() == 8)
-        .flat_map(|quad| quad.as_chunks::<2>().0.iter().map(|[x, y]| (*x, *y)));
-    let (left, top, right, bottom) = points.fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(l, t, r, b), (x, y)| {
-        (l.min(x), t.min(y), r.max(x), b.max(y))
-    });
+    let quads = Quads::of(page, element).await.with_context(|| format!("{} is not rendered", element.label))?;
+    let shift = crate::actions::quad_origin(page, &element.world.frame).await?;
+    let (left, top, right, bottom) =
+        quads.bounds().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(l, t, r, b), (left, top, right, bottom)| {
+            (l.min(left), t.min(top), r.max(right), b.max(bottom))
+        });
     if right - left < 1.0 || bottom - top < 1.0 {
         bail!("{} has no visible area to capture", element.label);
     }
@@ -660,7 +686,8 @@ async fn labels(page: &Arc<Page>) -> Result<Vec<Label>> {
         let Some(frame) = page.frame_by_seq(seq) else { continue };
         let world = page.world(&frame).await?;
         let refs = [Arg::Value(json!(refs))];
-        let (boxes, origin) = tokio::join!(page.call(&world, BOXES, &refs), viewport_origin(page, &frame));
+        let (boxes, origin) =
+            tokio::join!(page.call(&world, BOXES, &refs), crate::actions::viewport_origin(page, &frame));
         let boxes: Vec<(String, f64, f64, f64, f64)> =
             serde_json::from_value(boxes?).context("reading the boxes of the elements")?;
         let origin = origin?;
@@ -704,34 +731,6 @@ const BOXES: &str = "function(refs) { \
     } \
     return boxes; }";
 
-/// Where a frame's viewport lies in the main frame's viewport: the content box of its owner
-/// element, which the parent's process measures from its own viewport, plus where that lies.
-async fn viewport_origin(page: &Page, frame: &str) -> Result<(f64, f64)> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Owner {
-        backend_node_id: i64,
-    }
-    #[derive(Deserialize)]
-    struct Model {
-        model: BoxModel,
-    }
-    #[derive(Deserialize)]
-    struct BoxModel {
-        content: Vec<f64>,
-    }
-    let Some(parent) = page.frame_parent(frame) else { return Ok((0.0, 0.0)) };
-    let session = page.frame_session(&parent).context("the frame's parent is gone")?;
-    let owner: Owner = page.renderer_call("DOM.getFrameOwner", json!({"frameId": frame}), &session).await?;
-    let (model, above) = tokio::join!(
-        page.renderer_call::<Model>("DOM.getBoxModel", json!({"backendNodeId": owner.backend_node_id}), &session),
-        crate::actions::frame_offset(page, &parent, &session)
-    );
-    let (content, above) = (model?.model.content, above?);
-    let (x, y) = (content.first().copied().unwrap_or(0.0), content.get(1).copied().unwrap_or(0.0));
-    Ok((x + above.0, y + above.1))
-}
-
 pub async fn pdf(cx: &mut Cx<'_>, args: PdfArgs) -> Result<()> {
     let (paper_name, width, height) = paper(&args.format)?;
     let path = match &args.path {
@@ -739,17 +738,30 @@ pub async fn pdf(cx: &mut Cx<'_>, args: PdfArgs) -> Result<()> {
         None => cx.artifact("page", "pdf")?,
     };
     let page = cx.page().await?;
-    let session = page.session()?;
-    let file = crate::output::create(&path)?;
     let params = json!({"landscape": args.landscape, "printBackground": args.background, "paperWidth": width,
                         "paperHeight": height, "transferMode": "ReturnAsStream"});
-    let printed =
-        page.cdp.raw_within("Page.printToPDF", &params, Some(&session), cx.timeout).await.context("printing to PDF")?;
-    let printed: Printed = serde_json::from_str(printed.get()).context("the browser returned no PDF stream")?;
-    let written = save_stream(&page.cdp, &session, &printed.stream, file, &path).await?;
+    // Its own task, so a client that hangs up still gets the PDF saved and its stream closed.
+    let written = tokio::spawn(print(page, params, path.clone(), cx.timeout)).await??;
     let orientation = if args.landscape { " landscape" } else { "" };
     cx.say(format!("{} ({paper_name}{orientation}, {})", path.display(), crate::output::bytes(written)));
     Ok(())
+}
+
+/// Prints the page with `Page.printToPDF` `params` into `path`, which is replaced only once
+/// there is a PDF to put in it; returns the bytes written.
+async fn print(page: Arc<Page>, params: Value, path: PathBuf, timeout: Duration) -> Result<u64> {
+    let session = page.session()?;
+    let printed =
+        page.cdp.raw_within("Page.printToPDF", &params, Some(&session), timeout).await.context("printing to PDF")?;
+    let printed: Printed = serde_json::from_str(printed.get()).context("the browser returned no PDF stream")?;
+    let file = match crate::output::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            page.cdp.send("IO.close", json!({"handle": printed.stream}), Some(&session)).await.ok();
+            return Err(error);
+        }
+    };
+    save_stream(&page.cdp, &session, &printed.stream, file, &path).await
 }
 
 /// Copies a protocol stream (a PDF, a trace) into `file`, which is `path`, and closes the stream;
@@ -852,15 +864,20 @@ mod tests {
 
     #[test]
     fn grabs_fit_in_device_pixels() {
-        // A 1265x720 CSS viewport (scrollbar not counted) of a 1280 px wide view.
-        let device = |ratio: f64| (1265.0 * ratio, 720.0 * ratio);
+        // A 1265x720 CSS viewport (scrollbar not counted) of a 1280x720 view.
+        let visible = |ratio: f64| (1265.0 * ratio, 720.0 * ratio);
+        let whole = |ratio: f64| (1280.0 * ratio, 720.0 * ratio);
+        let grab = |pixels: (u32, u32), ratio: f64| fits(pixels, visible(ratio), whole(ratio));
         // Zoomed out to 90% on a 1x screen, the grab has fewer pixels than the CSS viewport.
-        assert!(covers((1152, 648), device(0.9)));
-        assert!(covers((1280, 720), device(1.0)));
-        assert!(covers((2560, 1440), device(2.0)));
+        assert!(grab((1152, 648), 0.9));
+        assert!(grab((1280, 720), 1.0));
+        assert!(grab((2560, 1440), 2.0));
         // A stale CSS-sized image from an abandoned capture is no grab of a 2x screen.
-        assert!(!covers((1280, 720), device(2.0)));
-        assert!(!covers((1265, 300), device(1.0)));
+        assert!(!grab((1280, 720), 2.0));
+        assert!(!grab((1265, 300), 1.0));
+        // Nor is an abandoned full-page capture at 1x, taller than the view.
+        assert!(!grab((1265, 4000), 1.0));
+        assert!(!grab((1600, 720), 1.0));
     }
 
     #[test]
@@ -883,5 +900,18 @@ mod tests {
         );
         // An element clip at twice the pixels.
         assert_eq!(place(&labels, (95.0, 45.0), 2.0, (60, 40)), [json!(["e1", 10.0, 10.0, 40.0, 20.0])]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_print_leaves_the_file_alone() {
+        let (page, cdp, _) = crate::page::tests::attached_page().await;
+        let refused = json!({"method": "Page.printToPDF", "message": "Printing is not available"});
+        crate::page::tests::steer(&cdp, "Test.fail", refused).await;
+        let path = std::env::temp_dir().join(format!("hba-print-{}.pdf", std::process::id()));
+        std::fs::write(&path, "an earlier report").expect("write");
+        let printed = print(page, json!({}), path.clone(), Duration::from_secs(1)).await;
+        assert!(printed.is_err(), "the browser refused to print");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "an earlier report");
+        std::fs::remove_file(path).expect("remove");
     }
 }

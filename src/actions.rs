@@ -76,24 +76,9 @@ pub async fn actionable_point(
                 if force {
                     return Ok(point);
                 }
-                let local = to_frame(page, element, point).await?;
-                let hit = page
-                    .call(
-                        &element.world,
-                        "function(e, p) { const r = this.expectHitTarget(p, e); return r === 'done' ? 'done' : r.hitTargetDescription; }",
-                        &[Arg::Object(&element.object), Arg::Value(json!({"x": local.0, "y": local.1}))],
-                    )
-                    .await?;
-                match hit.as_str() {
-                    Some("done") => return Ok(point),
-                    blocker => (
-                        format!(
-                            "{} is covered: {} intercepts pointer events; close the overlay first or pass --force",
-                            element.label,
-                            blocker.unwrap_or("another element")
-                        ),
-                        150,
-                    ),
+                match blocker(page, element, point).await? {
+                    None => return Ok(point),
+                    Some(blocker) => (covered(&element.label, &blocker), 150),
                 }
             };
             crate::trace!("actionable: {reason}");
@@ -110,29 +95,75 @@ pub async fn actionable_point(
     })
 }
 
+/// What takes the pointer at `point` (page coordinates) instead of `element`, if anything.
+async fn blocker(page: &Page, element: &Element, point: (f64, f64)) -> Result<Option<String>> {
+    let local = to_frame(page, element, point).await?;
+    let hit = page
+        .call(
+            &element.world,
+            "function(e, p) { const r = this.expectHitTarget(p, e); return r === 'done' ? 'done' : r.hitTargetDescription; }",
+            &[Arg::Object(&element.object), Arg::Value(json!({"x": local.0, "y": local.1}))],
+        )
+        .await?;
+    Ok(match hit.as_str() {
+        Some("done") => None,
+        blocker => Some(blocker.unwrap_or("another element").to_owned()),
+    })
+}
+
+fn covered(label: &str, blocker: &str) -> String {
+    format!("{label} is covered: {blocker} intercepts pointer events; close the overlay first or pass --force")
+}
+
+/// Moves the pointer to `point` on `element`. A human-like path crosses other elements, and
+/// hovering one can open a menu over the target, so unless `force` the target must still take
+/// the pointer once it is there.
+async fn reach<'a>(page: &'a Page, element: &Element, point: (f64, f64), force: bool) -> Result<input::Moved<'a>> {
+    let human = page.human();
+    let moved = input::move_to(page, point, human).await?;
+    if human
+        && !force
+        && let Some(blocker) = blocker(page, element, point).await?
+    {
+        bail!("{}", covered(&element.label, &blocker));
+    }
+    Ok(moved)
+}
+
+/// `DOM.getContentQuads` of an element: the boxes it is drawn in, in the coordinates of its
+/// frame's local root (see [`quad_origin`]).
 #[derive(Deserialize)]
-struct Quads {
+pub(crate) struct Quads {
     quads: Vec<Vec<f64>>,
+}
+
+impl Quads {
+    pub(crate) async fn of(page: &Page, element: &Element) -> Result<Self> {
+        page.renderer_call("DOM.getContentQuads", json!({"objectId": element.object}), &element.world.session).await
+    }
+
+    /// `(left, top, right, bottom)` of each quad.
+    pub(crate) fn bounds(&self) -> impl Iterator<Item = (f64, f64, f64, f64)> + '_ {
+        self.quads.iter().filter(|quad| quad.len() == 8).map(|q| {
+            let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
+            let low = |v: [f64; 4]| v.into_iter().fold(f64::MAX, f64::min);
+            let high = |v: [f64; 4]| v.into_iter().fold(f64::MIN, f64::max);
+            (low(xs), low(ys), high(xs), high(ys))
+        })
+    }
 }
 
 /// A point inside the element's first visible content quad: its center, an explicit offset
 /// from the quad's top-left corner (wherever the viewport cuts it), or a random spot in the
 /// central half when input is human-like.
 pub async fn click_point(page: &Page, element: &Element, offset: Option<(f64, f64)>) -> Result<(f64, f64)> {
-    let quads: Quads =
-        page.renderer_call("DOM.getContentQuads", json!({"objectId": element.object}), &element.world.session).await?;
-    let shift = frame_offset(page, &element.world.frame, &element.world.session).await?;
+    let quads = Quads::of(page, element).await?;
+    let shift = quad_origin(page, &element.world.frame).await?;
     let viewport = viewport(page).await?;
     let (origin, (left, top, right, bottom)) = quads
-        .quads
-        .iter()
-        .filter(|q| q.len() == 8)
-        .map(|q| {
-            let xs = [q[0], q[2], q[4], q[6]];
-            let ys = [q[1], q[3], q[5], q[7]];
-            let fold = |v: [f64; 4], f: fn(f64, f64) -> f64, init: f64| v.into_iter().fold(init, f);
-            let (left, right) = (fold(xs, f64::min, f64::MAX) + shift.0, fold(xs, f64::max, f64::MIN) + shift.0);
-            let (top, bottom) = (fold(ys, f64::min, f64::MAX) + shift.1, fold(ys, f64::max, f64::MIN) + shift.1);
+        .bounds()
+        .map(|(left, top, right, bottom)| {
+            let (left, top, right, bottom) = (left + shift.0, top + shift.1, right + shift.0, bottom + shift.1);
             ((left, top), (left.max(0.0), top.max(0.0), right.min(viewport.0), bottom.min(viewport.1)))
         })
         .find(|(_, (l, t, r, b))| r - l >= 1.0 && b - t >= 1.0)
@@ -156,27 +187,46 @@ pub async fn viewport(page: &Page) -> Result<(f64, f64)> {
     Ok((visual["clientWidth"].as_f64().unwrap_or(1e9), visual["clientHeight"].as_f64().unwrap_or(1e9)))
 }
 
-/// Offset of an out-of-process frame's viewport within the page; zero for same-process frames,
-/// whose quads Chromium already reports in page coordinates.
-pub async fn frame_offset(page: &Page, frame: &str, session: &str) -> Result<(f64, f64)> {
+/// Where `frame`'s viewport lies in the main frame's viewport: the content box of its owner
+/// element, which the parent's process measures from where its own coordinates start.
+pub(crate) async fn viewport_origin(page: &Page, frame: &str) -> Result<(f64, f64)> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Owner {
         backend_node_id: i64,
     }
-    let primary = page.session()?;
-    if *primary == *session {
-        return Ok((0.0, 0.0));
+    #[derive(Deserialize)]
+    struct Model {
+        model: BoxModel,
+    }
+    #[derive(Deserialize)]
+    struct BoxModel {
+        content: Vec<f64>,
     }
     let Some(parent) = page.frame_parent(frame) else { return Ok((0.0, 0.0)) };
-    let parent_session = page.frame_session(&parent).context("the frame's parent is gone")?;
-    let owner: Owner = page.renderer_call("DOM.getFrameOwner", json!({"frameId": frame}), &parent_session).await?;
-    let model: Value =
-        page.renderer_call("DOM.getBoxModel", json!({"backendNodeId": owner.backend_node_id}), &parent_session).await?;
-    let content = model["model"]["content"].as_array().context("the frame has no box")?;
-    let (x, y) = (content[0].as_f64().unwrap_or(0.0), content[1].as_f64().unwrap_or(0.0));
-    let above = Box::pin(frame_offset(page, &parent, &parent_session)).await?;
+    let session = page.frame_session(&parent).context("the frame's parent is gone")?;
+    let owner: Owner = page.renderer_call("DOM.getFrameOwner", json!({"frameId": frame}), &session).await?;
+    let (model, above) = tokio::join!(
+        page.renderer_call::<Model>("DOM.getBoxModel", json!({"backendNodeId": owner.backend_node_id}), &session),
+        Box::pin(quad_origin(page, &parent)),
+    );
+    let (content, above) = (model?.model.content, above?);
+    let (x, y) = (content.first().copied().unwrap_or(0.0), content.get(1).copied().unwrap_or(0.0));
     Ok((x + above.0, y + above.1))
+}
+
+/// Where the coordinates of `frame`'s quads and boxes start in the main frame's viewport.
+/// Chromium measures them from the viewport of the frame's local root, the topmost frame its
+/// process renders: the main frame's for same-process frames, so those need no shift.
+pub(crate) async fn quad_origin(page: &Page, frame: &str) -> Result<(f64, f64)> {
+    let mut root = frame.to_owned();
+    let session = page.frame_session(frame);
+    while let Some(parent) = page.frame_parent(&root)
+        && page.frame_session(&parent) == session
+    {
+        root = parent;
+    }
+    Box::pin(viewport_origin(page, &root)).await
 }
 
 /// Converts a page point into the element frame's own viewport coordinates.
@@ -185,6 +235,7 @@ async fn to_frame(page: &Page, element: &Element, point: (f64, f64)) -> Result<(
     if element.world.frame == main {
         return Ok(point);
     }
+    // Frames of the same process up to the local root, then where that lies.
     let origin = page
         .call(
             &element.world,
@@ -197,7 +248,7 @@ async fn to_frame(page: &Page, element: &Element, point: (f64, f64)) -> Result<(
             &[],
         )
         .await?;
-    let shift = frame_offset(page, &element.world.frame, &element.world.session).await?;
+    let shift = quad_origin(page, &element.world.frame).await?;
     let same_process = (origin[0].as_f64().unwrap_or(0.0), origin[1].as_f64().unwrap_or(0.0));
     Ok((point.0 - same_process.0 - shift.0, point.1 - same_process.1 - shift.1))
 }
@@ -219,21 +270,7 @@ pub async fn after(
         cx.say(report.trim_end());
     }
     if diff && page.is_live() && page.dialog().is_none() {
-        crate::inspect::snap(
-            cx,
-            crate::cli::SnapArgs {
-                interactive: false,
-                viewport: false,
-                diff: true,
-                scope: None,
-                depth: None,
-                boxes: false,
-                raw: false,
-                max: 24_000,
-                output: None,
-            },
-        )
-        .await?;
+        crate::inspect::snap_diff(cx, page).await?;
     }
     Ok(())
 }
@@ -246,9 +283,8 @@ pub async fn click(cx: &mut Cx<'_>, args: ClickArgs) -> Result<()> {
     let point = actionable_point(&page, &element, args.at, args.force, action_timeout(cx)).await?;
     let watch = cx.watch(&browser).await;
     let mark = page.mark();
-    let human = page.human();
-    input::move_to(&page, point, human).await?;
-    input::click(&page, args.button, args.count, modifiers, human).await?;
+    reach(&page, &element, point, args.force).await?;
+    input::click(&page, args.button, args.count, modifiers, page.human()).await?;
     let verb = match (args.count, args.button) {
         (2, _) => "double-clicked",
         (3, _) => "triple-clicked",
@@ -266,7 +302,7 @@ pub async fn hover(cx: &mut Cx<'_>, args: TargetArg) -> Result<()> {
     let point = actionable_point(&page, &element, None, false, action_timeout(cx)).await?;
     let watch = cx.watch(&browser).await;
     let mark = page.mark();
-    input::move_to(&page, point, page.human()).await?.taken().await?;
+    reach(&page, &element, point, false).await?.taken().await?;
     cx.say(format!("hovering {}", element.label));
     after(cx, &browser, &page, &mark, watch, false).await
 }
@@ -282,6 +318,11 @@ pub async fn focus(cx: &mut Cx<'_>, args: TargetArg) -> Result<()> {
 /// the start of an input that was not focused yet, as Playwright's `type` and `press` do.
 async fn focus_target(cx: &Cx<'_>, page: &Page, target: &str, before_keys: bool) -> Result<Element> {
     let element = page.resolve(target, action_timeout(cx)).await?;
+    focus_element(page, &element, before_keys).await?;
+    Ok(element)
+}
+
+async fn focus_element(page: &Page, element: &Element, before_keys: bool) -> Result<()> {
     let result = page
         .call(
             &element.world,
@@ -292,7 +333,7 @@ async fn focus_target(cx: &Cx<'_>, page: &Page, target: &str, before_keys: bool)
     if result.as_str() != Some("done") {
         bail!("could not focus {}: {result}", element.label);
     }
-    Ok(element)
+    Ok(())
 }
 
 /// Reads an editable element's text the way a user sees it.
@@ -300,31 +341,40 @@ const READ_VALUE: &str = "function(e) { \
     if (e.isContentEditable) return e.innerText.replace(/\\n$/, ''); \
     return 'value' in e ? String(e.value) : e.textContent; }";
 
+/// What kind of field `fill` has: `single` (one line), `multi`, or `value` for the input types
+/// whose value is set rather than typed, or why it cannot be filled.
+const FIELD_KIND: &str = "async function(e) { \
+    const r = await this.checkElementStates(e, ['visible', 'enabled', 'editable'], true); \
+    if (r === 'error:notconnected') return 'is detached from the page'; \
+    if (r && r.missingState) return `is not ${r.missingState}`; \
+    const t = this.retarget(e, 'follow-label') || e; \
+    if (!(t instanceof HTMLInputElement)) return 'multi'; \
+    const set = ['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week']; \
+    return set.includes(t.type.toLowerCase()) ? 'value' : 'single'; }";
+
 pub async fn fill(cx: &mut Cx<'_>, args: FillArgs) -> Result<()> {
     let page = cx.page().await?;
     let browser = cx.browser().await?;
     let text = args.text.replace("\r\n", "\n").replace('\r', "\n");
     let element = page.resolve(&args.target, action_timeout(cx)).await?;
-    let checks = page
-        .call(
-            &element.world,
-            "async function(e) { \
-               const r = await this.checkElementStates(e, ['visible', 'enabled', 'editable'], true); \
-               if (r === 'error:notconnected') return 'is detached from the page'; \
-               if (r && r.missingState) return `is not ${r.missingState}`; \
-               return e instanceof HTMLInputElement ? 'single' : 'multi'; }",
-            &[Arg::Object(&element.object)],
-        )
-        .await?;
-    match checks.as_str() {
+    let kind = page.call(&element.world, FIELD_KIND, &[Arg::Object(&element.object)]).await?;
+    let typed = match kind.as_str() {
         Some("single") if text.contains('\n') => {
             bail!("{} is a single-line field; it cannot hold newlines", element.label)
         }
-        Some("single" | "multi") => {}
+        Some("single" | "multi") => true,
+        Some("value") => false,
         other => bail!("{} {}", element.label, other.unwrap_or("cannot be filled")),
-    }
+    };
     let watch = cx.watch(&browser).await;
     let mark = page.mark();
+    if typed && page.human() {
+        click_to_focus(&page, &element).await?;
+    }
+    // The engine selects a typed field's text for the insertion below. Date, time, month,
+    // week, color and range inputs it sets with synthetic `input` and `change` events, as
+    // Playwright does: their keyboard entry follows the locale's field order or opens a picker,
+    // and a range moves one step per key, so no sequence of real keys sets an exact value.
     let outcome = page
         .call(
             &element.world,
@@ -350,6 +400,19 @@ pub async fn fill(cx: &mut Cx<'_>, args: FillArgs) -> Result<()> {
         input::press(&page, &input::Chord::parse("Enter")?, page.human()).await?;
     }
     after(cx, &browser, &page, &mark, watch, args.diff).await
+}
+
+/// Focuses a field by clicking it, as a user does, when it can take a click now: in view and
+/// not covered. Otherwise the engine focuses it from script, as Playwright's `fill` does.
+async fn click_to_focus(page: &Page, element: &Element) -> Result<()> {
+    let scroll = json!({"objectId": element.object});
+    page.renderer_call::<IgnoredAny>("DOM.scrollIntoViewIfNeeded", scroll, &element.world.session).await.ok();
+    let Ok(point) = click_point(page, element, None).await else { return Ok(()) };
+    if blocker(page, element, point).await?.is_some() {
+        return Ok(());
+    }
+    input::move_to(page, point, true).await?;
+    input::click(page, crate::cli::MouseButton::Left, 1, 0, true).await
 }
 
 pub async fn type_text(cx: &mut Cx<'_>, args: TypeArgs) -> Result<()> {
@@ -412,9 +475,8 @@ pub async fn set_checked(cx: &mut Cx<'_>, args: TargetArg, checked: bool) -> Res
     let point = actionable_point(&page, &element, None, false, action_timeout(cx)).await?;
     let watch = cx.watch(&browser).await;
     let mark = page.mark();
-    let human = page.human();
-    input::move_to(&page, point, human).await?;
-    input::click(&page, crate::cli::MouseButton::Left, 1, 0, human).await?;
+    reach(&page, &element, point, false).await?;
+    input::click(&page, crate::cli::MouseButton::Left, 1, 0, page.human()).await?;
     if state(Arc::clone(&page), element.clone()).await? != checked {
         bail!("clicking {} did not make it {verb}", element.label);
     }
@@ -422,13 +484,35 @@ pub async fn set_checked(cx: &mut Cx<'_>, args: TargetArg, checked: bool) -> Res
     after(cx, &browser, &page, &mark, watch, false).await
 }
 
+/// `[selected index, index of the option to choose, option count]` of a single-choice select,
+/// for choosing by keyboard; `null` when keys cannot choose it: a multiple select, or no single
+/// enabled option of that value or label.
+const SELECT_INDICES: &str = "function(e, wanted) { \
+    const s = this.retarget(e, 'follow-label'); \
+    if (!s || s.nodeName !== 'SELECT' || s.multiple || wanted.length !== 1) return null; \
+    const norm = t => this.utils.normalizeWhiteSpace(t), w = wanted[0], options = [...s.options]; \
+    const at = options.findIndex(o => o.value === w || o.label === w || norm(o.label) === norm(w)); \
+    if (at < 0 || !this.elementState(options[at], 'enabled').matches) return null; \
+    return [s.selectedIndex, at, options.length]; }";
+
+/// `[selected index, value]` of a select.
+const SELECTED: &str = "function(e) { const s = this.retarget(e, 'follow-label'); return [s.selectedIndex, s.value]; }";
+
 pub async fn select(cx: &mut Cx<'_>, args: SelectArgs) -> Result<()> {
     let page = cx.page().await?;
     let browser = cx.browser().await?;
     let element = page.resolve(&args.target, action_timeout(cx)).await?;
-    let options: Vec<Value> = args.values.iter().map(|value| json!({"valueOrLabel": value})).collect();
     let watch = cx.watch(&browser).await;
     let mark = page.mark();
+    let by_keys = if page.human() { select_by_keys(&page, &element, &args.values).await? } else { None };
+    if let Some(value) = by_keys {
+        cx.say(format!("selected {value} in {}", element.label));
+        return after(cx, &browser, &page, &mark, watch, false).await;
+    }
+    // Local pages, multiple choice and an option the keys could not reach: the engine sets the
+    // options with synthetic `input` and `change` events, as Playwright does. Choosing several
+    // options takes Control-clicks in the list, which has no keyboard equivalent to rely on.
+    let options: Vec<Value> = args.values.iter().map(|value| json!({"valueOrLabel": value})).collect();
     let selected = page
         .call(
             &element.world,
@@ -450,6 +534,44 @@ pub async fn select(cx: &mut Cx<'_>, args: SelectArgs) -> Result<()> {
         other => bail!("could not select in {}: {other}", element.label),
     }
     after(cx, &browser, &page, &mark, watch, false).await
+}
+
+/// Chooses the option of `values` in a single-choice select with the arrow keys (and Home or
+/// End from the far side), as a user does: the page gets trusted key, `input` and `change`
+/// events. Returns the selected value, or `None` when the keys cannot choose it.
+async fn select_by_keys(page: &Page, element: &Element, values: &[String]) -> Result<Option<String>> {
+    let args = [Arg::Object(&element.object), Arg::Value(json!(values))];
+    let indices = page.call(&element.world, SELECT_INDICES, &args).await?;
+    let Ok([_, wanted, count]) = serde_json::from_value::<[i64; 3]>(indices) else { return Ok(None) };
+    focus_element(page, element, false).await?;
+    let selected = || async {
+        let read = page.call(&element.world, SELECTED, &[Arg::Object(&element.object)]).await?;
+        Ok::<_, anyhow::Error>(serde_json::from_value::<(i64, String)>(read).unwrap_or((-1, String::new())))
+    };
+    let (mut at, mut value) = selected().await?;
+    let distance = (at - wanted).abs();
+    let jump = if wanted < distance {
+        Some("Home")
+    } else if count - 1 - wanted < distance {
+        Some("End")
+    } else {
+        None
+    };
+    if let Some(key) = jump {
+        input::press(page, &input::Chord::parse(key)?, true).await?;
+        (at, value) = selected().await?;
+    }
+    while at != wanted && page.dialog().is_none() {
+        let key = if wanted > at { "ArrowDown" } else { "ArrowUp" };
+        input::press(page, &input::Chord::parse(key)?, true).await?;
+        let (now, now_value) = selected().await?;
+        // The key moved nothing: the select does not take arrow keys, or the page stopped them.
+        if now == at {
+            break;
+        }
+        (at, value) = (now, now_value);
+    }
+    Ok((at == wanted).then_some(value))
 }
 
 pub async fn scroll(cx: &mut Cx<'_>, args: ScrollArgs) -> Result<()> {
@@ -621,7 +743,7 @@ pub async fn wait(cx: &mut Cx<'_>, args: WaitArgs) -> Result<()> {
     let deadline = Instant::now() + cx.timeout;
     let started = Instant::now();
     if let Some(state) = args.load {
-        page.wait_load(state, cx.timeout).await?;
+        page.wait_load(state, crate::page::Deadline::after(cx.timeout)).await?;
     } else if let Some(target) = &args.what {
         let gone = args.gone;
         loop {
@@ -685,7 +807,7 @@ async fn holds(page: &Page, args: &WaitArgs) -> Result<bool> {
 
 /// Whether `target` is on the page and visible.
 async fn visible(page: &Page, target: &str) -> Result<bool> {
-    let element = match page.resolve(target, Duration::ZERO).await {
+    let element = match page.locate(target, Duration::ZERO).await {
         Ok(element) => element,
         Err(error) if crate::inspect::not_found(&error) => return Ok(false),
         Err(error) => return Err(error),

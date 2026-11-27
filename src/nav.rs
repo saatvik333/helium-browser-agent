@@ -7,8 +7,10 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::browser::Browser;
 use crate::cli::{LoadState, OpenArgs, ReloadArgs};
 use crate::daemon::Cx;
+use crate::page::{Deadline, Mark, Page};
 
 pub async fn open(cx: &mut Cx<'_>, args: OpenArgs) -> Result<()> {
     let url = normalize_url(&args.url, &cx.cwd);
@@ -21,18 +23,13 @@ pub async fn open(cx: &mut Cx<'_>, args: OpenArgs) -> Result<()> {
     let mark = page.mark();
     page.goto(&url, args.wait, cx.timeout).await?;
     let tab = cx.tab_number(&page.tab);
-    let title = browser.tab_info(&page.tab).await?.map(|info| info.title).unwrap_or_default();
+    let title = title(&browser, &page).await?;
     if cx.json {
         let value = json!({"tab": tab, "id": page.tab, "page": page.page_target(), "url": page.url(), "title": title});
         cx.say(value.to_string());
         return Ok(());
     }
-    cx.say(format!("{tab} {} {}", crate::output::short_url(&page.url(), 120), quote_title(&title)));
-    let mut report = String::new();
-    page.report(&mark, &mut report);
-    for line in report.lines().filter(|line| !line.starts_with(['→', '↻'])) {
-        cx.say(line);
-    }
+    say_where(cx, &page, &mark, &format!("{tab} "), &title);
     Ok(())
 }
 
@@ -59,30 +56,42 @@ pub async fn history(cx: &mut Cx<'_>, delta: i64) -> Result<()> {
     let go = page.cdp.send("Page.navigateToHistoryEntry", json!({"entryId": entry.id}), Some(&session));
     page.heading_to(&entry.url, go).await?;
     page.settle(&mark, cx.timeout).await?;
-    finish(cx, &page, &mark).await
+    let browser = cx.browser().await?;
+    let title = title(&browser, &page).await?;
+    say_where(cx, &page, &mark, "", &title);
+    Ok(())
 }
 
 pub async fn reload(cx: &mut Cx<'_>, args: ReloadArgs) -> Result<()> {
     let page = cx.page().await?;
     let session = page.session()?;
+    let deadline = Deadline::after(cx.timeout);
     let mark = page.mark();
     let mut signals = page.subscribe();
     page.cdp.send("Page.reload", json!({"ignoreCache": args.hard}), Some(&session)).await?;
-    page.wait_until(&mut signals, cx.timeout, || page.navigations() != mark.navigations).await?;
-    page.wait_load(LoadState::Dom, cx.timeout).await?;
-    finish(cx, &page, &mark).await
+    let committed = || page.navigations() != mark.navigations;
+    page.wait_for(&mut signals, deadline, "the reloaded page to commit", committed).await?;
+    page.wait_load(LoadState::Dom, deadline).await?;
+    let browser = cx.browser().await?;
+    let title = title(&browser, &page).await?;
+    say_where(cx, &page, &mark, "", &title);
+    Ok(())
 }
 
-async fn finish(cx: &mut Cx<'_>, page: &crate::page::Page, mark: &crate::page::Mark) -> Result<()> {
-    let browser = cx.browser().await?;
-    let title = browser.tab_info(&page.tab).await?.map(|info| info.title).unwrap_or_default();
-    cx.say(format!("{} {}", crate::output::short_url(&page.url(), 120), quote_title(&title)));
+/// The tab's title as the browser lists it.
+async fn title(browser: &Browser, page: &Page) -> Result<String> {
+    Ok(browser.tab_info(&page.tab).await?.map(|info| info.title).unwrap_or_default())
+}
+
+/// Prints where the page is now, after `lead`, and what else changed since `mark`; the line
+/// itself says where the page went.
+fn say_where(cx: &mut Cx<'_>, page: &Page, mark: &Mark, lead: &str, title: &str) {
+    cx.say(format!("{lead}{} {}", crate::output::short_url(&page.url(), 120), quote_title(title)));
     let mut report = String::new();
     page.report(mark, &mut report);
     for line in report.lines().filter(|line| !line.starts_with(['→', '↻'])) {
         cx.say(line);
     }
-    Ok(())
 }
 
 fn quote_title(title: &str) -> String {

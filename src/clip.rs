@@ -14,6 +14,9 @@ use crate::daemon::Cx;
 /// Longest a clipboard tool may take; they answer in milliseconds unless the display hangs.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Characters of the clipboard printed before the rest spills to a file.
+const BUDGET: usize = 12_000;
+
 /// A clipboard tool's commands for reading and writing text.
 #[derive(Debug, PartialEq, Eq)]
 struct Tool {
@@ -66,8 +69,14 @@ pub async fn clip(cx: &mut Cx<'_>, args: ClipArgs) -> Result<()> {
         };
         match outcome {
             Ok(line) => {
-                cx.say(line);
-                return Ok(());
+                return crate::inspect::emit_budgeted(
+                    cx,
+                    &line,
+                    BUDGET,
+                    "clipboard",
+                    "txt",
+                    "all of it is in the file",
+                );
             }
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == ErrorKind::NotFound) => {}
             Err(error) => {

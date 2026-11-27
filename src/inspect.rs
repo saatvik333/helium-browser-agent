@@ -1,5 +1,6 @@
 //! Reading the page: snapshots, search, text and element properties.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -8,7 +9,10 @@ use serde_json::{Value, json};
 use crate::cli::{ElementState, FindArgs, GetArgs, GetWhat, IsArgs, SnapArgs, TextArgs};
 use crate::daemon::Cx;
 use crate::page::{Arg, Page};
-use crate::snapshot::{self, Options};
+use crate::snapshot::{self, Baseline, Options};
+
+/// Characters of a snapshot printed before the rest spills to a file.
+pub const SNAP_BUDGET: usize = 24_000;
 
 pub async fn snap(cx: &mut Cx<'_>, args: SnapArgs) -> Result<()> {
     let page = cx.page().await?;
@@ -19,31 +23,7 @@ pub async fn snap(cx: &mut Cx<'_>, args: SnapArgs) -> Result<()> {
         raw: args.raw,
         depth: args.depth,
     };
-    let mut tree = snapshot::capture(&page, &options).await?;
-    if let Some(scope) = &args.scope {
-        let reference = match crate::page::parse_ref(scope) {
-            Some((_, reference)) => reference,
-            None => ref_of(&page, scope, cx.timeout).await?,
-        };
-        tree = snapshot::subtree(&tree, &reference).with_context(|| format!("{scope} is not in the snapshot"))?;
-    }
-    let lines = snapshot::render(&tree, &options);
-    let previous = page.last_snapshot();
-    if args.scope.is_none() {
-        page.remember_snapshot(lines.clone());
-    }
-    let text = if args.diff {
-        match previous {
-            Some((loader, old)) if loader == page.loader() => match snapshot::diff(&old, &lines) {
-                Some(diff) if diff.is_empty() => "(no changes)".to_owned(),
-                Some(diff) => diff,
-                None => format!("(most of the page changed)\n{}", lines.join("\n")),
-            },
-            _ => format!("(new page)\n{}", lines.join("\n")),
-        }
-    } else {
-        lines.join("\n")
-    };
+    let text = snapshot_text(&page, options, args.scope.as_deref(), args.diff, cx.timeout).await?;
     if let Some(path) = &args.output {
         let path = cx.path(path);
         std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
@@ -51,6 +31,76 @@ pub async fn snap(cx: &mut Cx<'_>, args: SnapArgs) -> Result<()> {
         return Ok(());
     }
     emit_budgeted(cx, &text, args.max, "snapshot", "yml", "use -i, -v or -S REF to narrow it")
+}
+
+/// After an action, what changed since the tab's last snapshot, taken the same way again.
+pub async fn snap_diff(cx: &mut Cx<'_>, page: &Arc<Page>) -> Result<()> {
+    let (options, scope) = page.last_snapshot().map(|seen| (seen.options, seen.scope)).unwrap_or_default();
+    let text = match snapshot_text(page, options.clone(), scope.as_deref(), true, cx.timeout).await {
+        Ok(text) => text,
+        // The action removed the subtree the last snapshot showed.
+        Err(_) if scope.is_some() => snapshot_text(page, options, None, true, cx.timeout).await?,
+        Err(error) => return Err(error),
+    };
+    emit_budgeted(cx, &text, SNAP_BUDGET, "snapshot", "yml", "use -i, -v or -S REF to narrow it")
+}
+
+/// A fresh snapshot taken with `options`, of the subtree of `scope` (a ref or selector) if
+/// given, as text: the tree, or with `diff` what changed since the tab's last snapshot. It
+/// becomes the tab's last snapshot.
+async fn snapshot_text(
+    page: &Arc<Page>,
+    options: Options,
+    scope: Option<&str>,
+    diff: bool,
+    timeout: Duration,
+) -> Result<String> {
+    let mut tree = snapshot::capture(page, &options).await?;
+    let scope = match scope {
+        Some(scope) => {
+            let reference = match crate::page::parse_ref(scope) {
+                Some((_, reference)) => reference,
+                None => ref_of(page, scope, timeout).await?,
+            };
+            tree = snapshot::subtree(tree, &reference).with_context(|| format!("{scope} is not in the snapshot"))?;
+            Some(reference)
+        }
+        None => None,
+    };
+    let lines = snapshot::render(tree, &options);
+    let text = if diff {
+        let loader = page.loader();
+        diff_text(page.last_snapshot().as_ref(), loader.as_deref(), &options, scope.as_deref(), &lines)
+    } else {
+        lines.join("\n")
+    };
+    page.remember_snapshot(options, scope, lines);
+    Ok(text)
+}
+
+/// What `snap -d` prints for `lines`, a snapshot of the document of `loader` taken with
+/// `options` (of the subtree of `scope`), given the tab's last snapshot.
+fn diff_text(
+    previous: Option<&Baseline>,
+    loader: Option<&str>,
+    options: &Options,
+    scope: Option<&str>,
+    lines: &[String],
+) -> String {
+    let whole = || lines.join("\n");
+    match previous {
+        Some(seen) if seen.loader.as_deref() == loader => {
+            if seen.options != *options || seen.scope.as_deref() != scope {
+                return format!("(the last snapshot was taken with other options; all of this one)\n{}", whole());
+            }
+            match snapshot::diff(&seen.lines, lines) {
+                Some(diff) if diff.is_empty() => "(no changes)".to_owned(),
+                Some(diff) => diff,
+                None => format!("(most of the page changed)\n{}", whole()),
+            }
+        }
+        _ => format!("(new page)\n{}", whole()),
+    }
 }
 
 /// Prints `text`, or its head plus the path of a file holding all of it.
@@ -71,7 +121,7 @@ pub fn emit_budgeted(cx: &mut Cx<'_>, text: &str, max: usize, stem: &str, extens
 
 /// The snapshot ref of the element a selector matches.
 async fn ref_of(page: &Page, selector: &str, timeout: Duration) -> Result<String> {
-    let element = page.resolve(selector, timeout).await?;
+    let element = page.locate(selector, timeout).await?;
     let value = page
         .call(
             &element.world,
@@ -83,32 +133,42 @@ async fn ref_of(page: &Page, selector: &str, timeout: Duration) -> Result<String
 }
 
 pub async fn find(cx: &mut Cx<'_>, args: FindArgs) -> Result<()> {
+    const SHOWN: usize = 50;
     let page = cx.page().await?;
     let options = Options::default();
     let tree = snapshot::capture(&page, &options).await?;
-    let lines = snapshot::render(&tree, &options);
-    page.remember_snapshot(lines.clone());
+    let lines = snapshot::render(tree, &options);
     let query = args.query.to_lowercase();
-    let role = args.role.as_deref().map(str::to_lowercase);
     let hits: Vec<&str> = lines
         .iter()
         .map(|line| line.trim_start())
-        .filter(|line| line.to_lowercase().contains(&query))
-        .filter(|line| {
-            role.as_deref()
-                .is_none_or(|role| line.strip_prefix("- ").is_some_and(|rest| rest.to_lowercase().starts_with(role)))
-        })
+        .filter(|line| line_matches(line, &query, args.role.as_deref()))
         .collect();
-    if hits.is_empty() {
+    let total = hits.len();
+    let shown: Vec<String> = hits.into_iter().take(SHOWN).map(str::to_owned).collect();
+    // Its refs are the tab's current ones, so it is the snapshot `snap -d` compares against.
+    page.remember_snapshot(options, None, lines);
+    if total == 0 {
         bail!("nothing on the page matches {:?}", args.query);
     }
-    for hit in hits.iter().take(50) {
-        cx.say(*hit);
+    for hit in shown {
+        cx.say(hit);
     }
-    if hits.len() > 50 {
-        cx.say(format!("… {} more; refine the query or add --role", hits.len() - 50));
+    if total > SHOWN {
+        cx.say(format!("… {} more; refine the query or add --role", total - SHOWN));
     }
     Ok(())
+}
+
+/// Whether a snapshot line (without its indent) mentions `query`, in lowercase, and is an
+/// element of exactly `role` when one is given: `tab` is not `tablist`.
+fn line_matches(line: &str, query: &str, role: Option<&str>) -> bool {
+    let role_matches = || {
+        let Some(rest) = line.strip_prefix("- ") else { return false };
+        let key = rest.strip_prefix('\'').unwrap_or(rest);
+        key.split([' ', ':']).next().is_some_and(|found| role.is_some_and(|role| found.eq_ignore_ascii_case(role)))
+    };
+    line.to_lowercase().contains(query) && (role.is_none() || role_matches())
 }
 
 pub async fn text(cx: &mut Cx<'_>, args: TextArgs) -> Result<()> {
@@ -117,7 +177,7 @@ pub async fn text(cx: &mut Cx<'_>, args: TextArgs) -> Result<()> {
         (this.document.body ? this.document.body.innerText : this.document.documentElement.textContent); \
         return (t || '').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim(); }";
     let value = if let Some(target) = &args.target {
-        let element = page.resolve(target, cx.timeout).await?;
+        let element = page.locate(target, cx.timeout).await?;
         page.call(&element.world, function, &[Arg::Object(&element.object)]).await?
     } else {
         let world = page.main_world().await?;
@@ -156,7 +216,7 @@ pub async fn get(cx: &mut Cx<'_>, args: GetArgs) -> Result<()> {
         cx.say(count.to_string());
         return Ok(());
     }
-    let element = page.resolve(target, cx.timeout).await?;
+    let element = page.locate(target, cx.timeout).await?;
     let (function, arg) = match args.what {
         GetWhat::Html => ("function(e) { return e.outerHTML; }", Value::Null),
         GetWhat::Inner => ("function(e) { return e.innerHTML; }", Value::Null),
@@ -198,7 +258,7 @@ pub async fn get(cx: &mut Cx<'_>, args: GetArgs) -> Result<()> {
 
 pub async fn is(cx: &mut Cx<'_>, args: IsArgs) -> Result<()> {
     let page = cx.page().await?;
-    let element = match page.resolve(&args.target, Duration::ZERO).await {
+    let element = match page.locate(&args.target, Duration::ZERO).await {
         Ok(element) => element,
         // An element that is not on the page is hidden; any other failure answers nothing.
         Err(error) if not_found(&error) && matches!(args.state, ElementState::Hidden | ElementState::Visible) => {
@@ -233,11 +293,48 @@ pub async fn is(cx: &mut Cx<'_>, args: IsArgs) -> Result<()> {
 /// Whether an error of [`Page::resolve`] means the element is not on the page, unlike an
 /// ambiguous or invalid selector, a dialog or a closed tab.
 pub fn not_found(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.starts_with("no element matches ") || message.contains(" is not on the page any more")
+    error.downcast_ref::<crate::page::NotFound>().is_some()
 }
 
 /// Whether an error only says the page was between documents, so asking again will answer.
 pub fn retryable(error: &anyhow::Error) -> bool {
-    error.to_string().ends_with("; retry")
+    error.downcast_ref::<crate::page::Retry>().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline(options: Options, scope: Option<&str>) -> Baseline {
+        let lines = ["- button \"Save\" [ref=e1]", "- button \"Undo\" [ref=e2]"].map(String::from).to_vec();
+        Baseline { loader: Some("L".into()), options, scope: scope.map(str::to_owned), lines }
+    }
+
+    #[test]
+    fn diffs_compare_only_snapshots_taken_the_same_way() {
+        let lines = ["- button \"Saved\" [ref=e1]", "- button \"Undo\" [ref=e2]"].map(String::from).to_vec();
+        let full = Options::default();
+        let same = diff_text(Some(&baseline(full.clone(), None)), Some("L"), &full, None, &lines);
+        assert!(same.starts_with("- - button \"Save\""), "{same}");
+        // `snap -i` before `click -d`: the interactive lines are no baseline for a full render.
+        let interactive = Options { interactive: true, ..Options::default() };
+        let other = diff_text(Some(&baseline(interactive, None)), Some("L"), &full, None, &lines);
+        assert!(other.starts_with("(the last snapshot was taken with other options"), "{other}");
+        let subtree = diff_text(Some(&baseline(full.clone(), Some("e7"))), Some("L"), &full, None, &lines);
+        assert!(subtree.starts_with("(the last snapshot was taken with other options"), "{subtree}");
+        let navigated = diff_text(Some(&baseline(full.clone(), None)), Some("M"), &full, None, &lines);
+        assert!(navigated.starts_with("(new page)"), "{navigated}");
+    }
+
+    #[test]
+    fn find_roles_match_whole_words() {
+        let line = "- tablist \"Sections\" [ref=e3]:";
+        assert!(line_matches(line, "sections", Some("tablist")));
+        assert!(!line_matches(line, "sections", Some("tab")), "tab is not tablist");
+        assert!(line_matches("- tab \"Sections\" [ref=e4]", "sections", Some("TAB")));
+        assert!(!line_matches("- listitem: Sections", "sections", Some("list")));
+        assert!(line_matches("- 'button \"a: b\" [ref=e5]'", "a: b", Some("button")));
+        assert!(line_matches("- text: Sections", "sections", None));
+        assert!(!line_matches("- text: Sections", "nowhere", None));
+    }
 }

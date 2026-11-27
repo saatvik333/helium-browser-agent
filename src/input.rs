@@ -91,8 +91,20 @@ pub async fn move_to(page: &Page, to: (f64, f64), human: bool) -> Result<Moved<'
     Ok(Moved(last.map(|ack| Box::pin(ack) as Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>)))
 }
 
-/// Presses and releases a mouse button `count` times at the current pointer position.
+/// Presses and releases a mouse button `count` times at the current pointer position, with the
+/// keys of the `modifiers` mask held down around the clicks, as a hand on the keyboard does.
 pub async fn click(page: &Page, button: MouseButton, count: u8, modifiers: i64, human: bool) -> Result<()> {
+    let keys = modifier_keys(modifiers)?;
+    hold(page, &keys).await?;
+    if human && !keys.is_empty() {
+        pause(20, 60).await;
+    }
+    let clicked = clicks(page, button, count, modifiers, human).await;
+    let released = release(page, &keys).await;
+    clicked.and(released)
+}
+
+async fn clicks(page: &Page, button: MouseButton, count: u8, modifiers: i64, human: bool) -> Result<()> {
     let (x, y) = page.mouse();
     let held = page.buttons();
     for click_count in 1..=count {
@@ -120,6 +132,39 @@ pub async fn click(page: &Page, button: MouseButton, count: u8, modifiers: i64, 
         if human && click_count < count {
             pause(60, 110).await;
         }
+    }
+    Ok(())
+}
+
+/// The keys of a CDP modifier mask, in the order they go down.
+fn modifier_keys(mask: i64) -> Result<Vec<Key>> {
+    keyboard::MODIFIERS
+        .iter()
+        .filter(|name| mask & keyboard::modifier_bit(name) != 0)
+        .map(|name| keyboard::key(name, false))
+        .collect()
+}
+
+/// Puts modifier `keys` down, in order.
+async fn hold(page: &Page, keys: &[Key]) -> Result<()> {
+    let mut modifiers = 0;
+    for key in keys {
+        modifiers |= keyboard::modifier_bit(&key.key);
+        key_event(page, key, true, modifiers).await?;
+    }
+    Ok(())
+}
+
+/// Lets modifier `keys` that [`hold`] put down go again, in reverse. A dialog blocks the page
+/// until it is handled, so the keys stay down then.
+async fn release(page: &Page, keys: &[Key]) -> Result<()> {
+    let mut modifiers = keys.iter().fold(0, |mask, key| mask | keyboard::modifier_bit(&key.key));
+    for key in keys.iter().rev() {
+        if page.dialog().is_some() {
+            break;
+        }
+        modifiers &= !keyboard::modifier_bit(&key.key);
+        key_event(page, key, false, modifiers).await?;
     }
     Ok(())
 }
@@ -185,7 +230,7 @@ impl Chord {
     pub fn parse(chord: &str) -> Result<Self> {
         let names = keyboard::split_chord(chord);
         let (last, names) = names.split_last().expect("split_chord returns at least one key");
-        let mut held = Vec::with_capacity(names.len());
+        let mut held = Vec::with_capacity(names.len() + 1);
         let mut shift = false;
         for name in names {
             let key = keyboard::key(name, shift)?;
@@ -197,7 +242,17 @@ impl Chord {
         }
         let mut key = keyboard::key(last, shift)?;
         // With Control/Alt/Meta held the key produces no text, as in a real keyboard shortcut.
-        if held.iter().any(|modifier| modifier.key != "Shift") {
+        let shortcut = held.iter().any(|modifier| modifier.key != "Shift");
+        if key.needs_shift() && !shift {
+            if shortcut {
+                // `Control+A` is Control and the A key, which sends `a` without Shift.
+                key = keyboard::key(&key.code, false)?;
+            } else {
+                // A capital letter or symbol alone is typed with Shift held, as on a keyboard.
+                held.push(keyboard::key("Shift", false)?);
+            }
+        }
+        if shortcut {
             key.text.clear();
         }
         Ok(Self { held, key })
@@ -206,30 +261,29 @@ impl Chord {
 
 /// Presses a chord: modifiers down, key down/up, modifiers up.
 pub async fn press(page: &Page, chord: &Chord, human: bool) -> Result<()> {
-    let mut modifiers = 0;
-    for key in &chord.held {
-        modifiers |= keyboard::modifier_bit(&key.key);
-        key_event(page, key, true, modifiers).await?;
-    }
-    key_event(page, &chord.key, true, modifiers).await?;
-    if human {
-        pause(30, 80).await;
-    }
-    if page.dialog().is_none() {
-        key_event(page, &chord.key, false, modifiers).await?;
-    }
-    for key in chord.held.iter().rev() {
-        if page.dialog().is_some() {
-            break;
-        }
-        modifiers &= !keyboard::modifier_bit(&key.key);
-        key_event(page, key, false, modifiers).await?;
-    }
-    Ok(())
+    stroke(page, &chord.held, &chord.key, human.then_some((30, 80))).await
 }
 
-/// Types text with key events; characters outside the layout are inserted as text.
+/// Presses `key` with modifier keys `held` down around it, keeping the key down for a random
+/// `hold_ms` (milliseconds) when given. A dialog the key opens blocks the page until it is
+/// handled, so what is down then stays down.
+async fn stroke(page: &Page, held: &[Key], key: &Key, hold_ms: Option<(u64, u64)>) -> Result<()> {
+    hold(page, held).await?;
+    let modifiers = held.iter().fold(0, |mask, key| mask | keyboard::modifier_bit(&key.key));
+    key_event(page, key, true, modifiers).await?;
+    if let Some((min, max)) = hold_ms {
+        pause(min, max).await;
+    }
+    if page.dialog().is_none() {
+        key_event(page, key, false, modifiers).await?;
+    }
+    release(page, held).await
+}
+
+/// Types text with key events, Shift held for capitals and symbols; characters outside the
+/// layout are inserted as text.
 pub async fn type_text(page: &Page, text: &str, delay: Option<u64>, human: bool) -> Result<()> {
+    let shift = keyboard::key("Shift", false)?;
     let mut buffer = [0; 4];
     let total = text.chars().count();
     for (typed, c) in text.chars().enumerate() {
@@ -242,14 +296,8 @@ pub async fn type_text(page: &Page, text: &str, delay: Option<u64>, human: bool)
         }
         if keyboard::typeable(c) {
             let key = keyboard::key(c.encode_utf8(&mut buffer), false)?;
-            key_event(page, &key, true, 0).await?;
-            if human {
-                pause(15, 45).await;
-            }
-            // A dialog the key opened blocks the page until it is handled.
-            if page.dialog().is_none() {
-                key_event(page, &key, false, 0).await?;
-            }
+            let held = if key.needs_shift() { std::slice::from_ref(&shift) } else { &[] };
+            stroke(page, held, &key, human.then_some((15, 45))).await?;
         } else {
             page.input("Input.insertText", json!({"text": c.to_string()})).await?;
         }
@@ -280,7 +328,7 @@ pub fn modifier_mask(names: &[String]) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::Chord;
+    use super::{Chord, Key, modifier_keys};
 
     #[test]
     fn chords_are_checked_whole_before_pressing() {
@@ -290,5 +338,25 @@ mod tests {
         assert_eq!(shortcut.held.len(), 2);
         assert_eq!((shortcut.key.key.as_str(), shortcut.key.text.as_str()), ("A", ""));
         assert_eq!(Chord::parse("Shift+KeyA").unwrap().key.text, "A");
+    }
+
+    #[test]
+    fn shifted_keys_go_down_with_shift() {
+        // A capital alone holds Shift, as typing it on a keyboard does.
+        let capital = Chord::parse("A").unwrap();
+        let held: Vec<&str> = capital.held.iter().map(|key| key.key.as_str()).collect();
+        assert_eq!((held, capital.key.key.as_str(), capital.key.text.as_str()), (vec!["Shift"], "A", "A"));
+        // In a shortcut the letter's case says nothing: Control+A is Control and `a`.
+        let shortcut = Chord::parse("Control+A").unwrap();
+        let held: Vec<&str> = shortcut.held.iter().map(|key| key.key.as_str()).collect();
+        assert_eq!((held, shortcut.key.key.as_str(), shortcut.key.key_code), (vec!["Control"], "a", 65));
+        assert_eq!(Chord::parse("a").unwrap().held, Vec::<Key>::new());
+    }
+
+    #[test]
+    fn modifier_masks_name_their_keys_in_order() {
+        let keys: Vec<String> = modifier_keys(2 | 8).unwrap().into_iter().map(|key| key.key).collect();
+        assert_eq!(keys, ["Control", "Shift"]);
+        assert_eq!(modifier_keys(0).unwrap(), Vec::<Key>::new());
     }
 }

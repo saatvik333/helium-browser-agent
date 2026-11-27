@@ -36,11 +36,18 @@ pub struct Key {
     pub text: String,
     pub location: u8,
     shifted: Option<Box<Key>>,
+    /// This is the key's Shift variant (`A`, `!`), which a keyboard types with Shift held.
+    with_shift: bool,
 }
 
 impl Key {
     pub fn is_keypad(&self) -> bool {
         self.location == KEYPAD
+    }
+
+    /// Whether typing this key takes Shift held down.
+    pub fn needs_shift(&self) -> bool {
+        self.with_shift
     }
 }
 
@@ -77,11 +84,13 @@ fn build() -> HashMap<String, Key> {
             text: if definition.key.chars().count() == 1 { definition.key.clone() } else { text },
             location: definition.location,
             shifted: None,
+            with_shift: false,
         };
         let shifted = definition.shift_key.as_ref().map(|shift_key| Key {
             key: shift_key.clone(),
             text: shift_key.clone(),
             key_code: definition.shift_key_code.unwrap_or(definition.key_code),
+            with_shift: true,
             ..base.clone()
         });
         keys.insert(code.clone(), Key { shifted: shifted.clone().map(Box::new), ..base.clone() });
@@ -163,6 +172,15 @@ mod tests {
     fn keypad_keys_are_marked() {
         assert!(key("Numpad0", false).unwrap().is_keypad());
         assert!(!key("Digit0", false).unwrap().is_keypad());
+    }
+
+    #[test]
+    fn shifted_keys_say_so() {
+        assert!(key("A", false).unwrap().needs_shift());
+        assert!(key("KeyA", true).unwrap().needs_shift());
+        assert!(key("!", false).unwrap().needs_shift());
+        assert!(!key("a", false).unwrap().needs_shift());
+        assert!(!key("Enter", false).unwrap().needs_shift());
     }
 
     #[test]

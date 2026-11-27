@@ -246,15 +246,18 @@ impl Page {
 /// The ways [`Page::evaluate_in_frame`] runs `code`, in order: as an expression, as statements
 /// returning the last one's value (as `js` on the main frame does), then as plain statements.
 /// The code runs in an async function, so whatever it throws rejects the promise the call
-/// returns: only code that does not compile as one form is tried as the next. A split inside a
-/// string or comment does not compile, so it falls through to the next form.
+/// returns: only code that does not compile as one form is tried as the next. The split is at
+/// the last `;`: one inside a string, template or regex does not compile and falls through. A
+/// newline is no split, because the next line may continue the statement (`a\n+ b`, `f\n(x)`),
+/// and neither is a `;` behind a `//` comment on its line.
 fn frame_functions(code: &str) -> Vec<String> {
     let wrap =
         |body: String| format!("function() {{ return (async function() {{ {body}\n }}).call(this.defaultView); }}");
     let expression = code.trim_end().trim_end_matches(';');
     let mut forms = vec![wrap(format!("return ({expression}\n);"))];
-    if let Some(split) = expression.rfind([';', '\n'])
+    if let Some(split) = expression.rfind(';')
         && !expression[split + 1..].trim().is_empty()
+        && !expression[..split].rsplit('\n').next().is_some_and(|line| line.contains("//"))
     {
         let (head, last) = (&expression[..=split], &expression[split + 1..]);
         forms.push(wrap(format!("{head}\nreturn ({last}\n);")));
@@ -356,5 +359,15 @@ mod tests {
         assert!(forms[1].contains("const a = 1;\nreturn ( a + 1\n);"), "{forms:?}");
         // `eval` is subject to the page's content security policy; a function declaration is not.
         assert!(forms.iter().all(|form| !form.contains("eval")));
+    }
+
+    #[test]
+    fn frame_code_is_never_split_where_a_statement_goes_on() {
+        // The next line continues the statement: returning it alone would change what runs.
+        for code in ["const t = a\n  + b", "x = y\n(z)", "x = 1; // a; b"] {
+            assert_eq!(frame_functions(code).len(), 2, "{code:?} was split: {:?}", frame_functions(code));
+        }
+        let forms = frame_functions("const t = a\n  + b; t");
+        assert!(forms[1].contains("+ b;\nreturn ( t\n);"), "{forms:?}");
     }
 }
